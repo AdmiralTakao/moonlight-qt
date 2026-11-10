@@ -158,7 +158,7 @@ void StreamingPreferences::reload()
     enableHdr = settings.value(SER_HDR, false).toBool();
     upscalingMode = static_cast<UpscalingMode>(settings.value(SER_GFN_UPSCALING,
                                                      static_cast<int>(UpscalingMode::UM_AI)).toInt());
-    sharpness = qBound(0, settings.value(SER_GFN_SHARPNESS, 25).toInt(), 100);
+    sharpness = qBound(0, settings.value(SER_GFN_SHARPNESS, 0).toInt(), 100);
     chromaReconstruction = settings.value(SER_GFN_CHROMARECON, true).toBool();
     lowLatencyMode = settings.value(SER_GFN_LOWLATENCY, false).toBool();
     captureSysKeysMode = static_cast<CaptureSysKeysMode>(settings.value(SER_CAPTURESYSKEYS,

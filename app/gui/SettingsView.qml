@@ -930,7 +930,7 @@ Flickable {
                     vsyncCheck.checked = true
                     framePacingCheck.checked = false
                     setUpscalingMode(StreamingPreferences.UM_FSR)
-                    sharpnessSlider.value = 25
+                    sharpnessSlider.value = 10
                     chromaReconCheck.checked = true
                 }
                 else {
@@ -939,7 +939,7 @@ Flickable {
                     vsyncCheck.checked = true
                     framePacingCheck.checked = true
                     setUpscalingMode(StreamingPreferences.UM_AI)
-                    sharpnessSlider.value = 35
+                    sharpnessSlider.value = 15
                     chromaReconCheck.checked = true
                 }
 
