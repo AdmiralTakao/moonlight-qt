@@ -50,6 +50,10 @@
 #define SER_SWAPFACEBUTTONS "swapfacebuttons"
 #define SER_CAPTURESYSKEYS "capturesyskeys"
 #define SER_KEEPAWAKE "keepawake"
+#define SER_GFN_UPSCALING "gfn_upscaling"
+#define SER_GFN_SHARPNESS "gfn_sharpness"
+#define SER_GFN_CHROMARECON "gfn_chromarecon"
+#define SER_GFN_LOWLATENCY "gfn_lowlatency"
 #define SER_LANGUAGE "language"
 #define SER_RENDERER "renderer"
 
@@ -152,6 +156,11 @@ void StreamingPreferences::reload()
     swapFaceButtons = settings.value(SER_SWAPFACEBUTTONS, false).toBool();
     keepAwake = settings.value(SER_KEEPAWAKE, true).toBool();
     enableHdr = settings.value(SER_HDR, false).toBool();
+    upscalingMode = static_cast<UpscalingMode>(settings.value(SER_GFN_UPSCALING,
+                                                     static_cast<int>(UpscalingMode::UM_AI)).toInt());
+    sharpness = qBound(0, settings.value(SER_GFN_SHARPNESS, 25).toInt(), 100);
+    chromaReconstruction = settings.value(SER_GFN_CHROMARECON, true).toBool();
+    lowLatencyMode = settings.value(SER_GFN_LOWLATENCY, false).toBool();
     captureSysKeysMode = static_cast<CaptureSysKeysMode>(settings.value(SER_CAPTURESYSKEYS,
                                                          static_cast<int>(CaptureSysKeysMode::CSK_OFF)).toInt());
     audioConfig = static_cast<AudioConfig>(settings.value(SER_AUDIOCFG,
@@ -362,6 +371,10 @@ void StreamingPreferences::save()
     settings.setValue(SER_SWAPFACEBUTTONS, swapFaceButtons);
     settings.setValue(SER_CAPTURESYSKEYS, captureSysKeysMode);
     settings.setValue(SER_KEEPAWAKE, keepAwake);
+    settings.setValue(SER_GFN_UPSCALING, static_cast<int>(upscalingMode));
+    settings.setValue(SER_GFN_SHARPNESS, sharpness);
+    settings.setValue(SER_GFN_CHROMARECON, chromaReconstruction);
+    settings.setValue(SER_GFN_LOWLATENCY, lowLatencyMode);
 }
 
 int StreamingPreferences::getDefaultBitrate(int width, int height, int fps, bool yuv444)

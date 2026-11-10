@@ -45,6 +45,12 @@ typedef struct _DECODER_PARAMETERS {
     bool enableVsync;
     bool enableFramePacing;
     bool testOnly;
+
+    // GFN fork post-processing options (only used by renderers that support them)
+    StreamingPreferences::UpscalingMode upscalingMode;
+    int sharpness; // 0-100 (%)
+    bool chromaReconstruction;
+    bool lowLatencyMode;
 } DECODER_PARAMETERS, *PDECODER_PARAMETERS;
 
 #define WINDOW_STATE_CHANGE_SIZE 0x01

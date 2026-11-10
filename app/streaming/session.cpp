@@ -298,6 +298,17 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.vds = vds;
     params.renderer = renderer;
 
+    // GFN fork: post-processing options. These are irrelevant for test-only
+    // decoders, so keep them off there to avoid allocating extra resources.
+    {
+        StreamingPreferences* prefs = (s_ActiveSession != nullptr && s_ActiveSession->m_Preferences != nullptr) ?
+                                          s_ActiveSession->m_Preferences : StreamingPreferences::get();
+        params.upscalingMode = testOnly ? StreamingPreferences::UM_OFF : prefs->upscalingMode;
+        params.sharpness = testOnly ? 0 : prefs->sharpness;
+        params.chromaReconstruction = !testOnly && prefs->chromaReconstruction;
+        params.lowLatencyMode = !testOnly && prefs->lowLatencyMode;
+    }
+
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "V-sync %s",
                 enableVsync ? "enabled" : "disabled");
@@ -2213,7 +2224,14 @@ void Session::exec()
                 // than the display.
                 int displayHz = StreamUtils::getDisplayRefreshRate(m_Window);
                 bool enableVsync = m_Preferences->enableVsync;
-                if (displayHz + 5 < m_StreamConfig.fps) {
+                if (m_Preferences->lowLatencyMode) {
+                    // GFN fork: Low-latency mode always renders without V-sync
+                    // (and therefore without frame pacing) to minimize latency.
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "Low-latency mode: disabling V-sync and frame pacing");
+                    enableVsync = false;
+                }
+                else if (displayHz + 5 < m_StreamConfig.fps) {
                     SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                                 "Disabling V-sync because refresh rate limit exceeded");
                     enableVsync = false;

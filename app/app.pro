@@ -390,6 +390,9 @@ config_SL {
 }
 win32 {
     HEADERS += streaming/video/ffmpeg-renderers/dxutil.h
+
+    # GFN fork: D3D11 post-processing shaders (compiled by shaders/build_gfn_hlsl.ps1)
+    RESOURCES += gfn_shaders.qrc
 }
 win32:!winrt {
     message(DXVA2 and D3D11VA renderers selected)

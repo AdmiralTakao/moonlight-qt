@@ -64,6 +64,11 @@ jobs:
           arch: win64_msvc2022_arm64_cross_compiled
           version: ${{ matrix.qt_version }}
 
+      - name: Compile GFN fork shaders (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./app/shaders/build_gfn_hlsl.ps1
+
       - name: Build x64 binaries (Windows)
         if: runner.os == 'Windows'
         shell: cmd
@@ -97,6 +102,15 @@ jobs:
         with:
           name: Moonlight-${{ runner.os }}-x64-${{ env.CI_VERSION }}
           path: build/deploy-x64-release/*
+          if-no-files-found: error
+
+      - name: Upload Installer (Windows)
+        uses: actions/upload-artifact@v6
+        if: runner.os == 'Windows'
+        with:
+          name: Moonlight-GFN-Setup-${{ env.CI_VERSION }}
+          path: build/installer-Release/MoonlightSetup-*.exe
+          compression-level: 0
           if-no-files-found: error
 
       - name: Upload Binaries (Windows arm64)

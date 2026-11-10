@@ -874,6 +874,256 @@ Flickable {
             }
         }
 
+        // GFN fork: GeForce-NOW-style features
+        GroupBox {
+            id: gfnSettingsGroupBox
+            width: (parent.width - (parent.leftPadding + parent.rightPadding))
+            padding: 12
+            title: "<font color=\"skyblue\">" + "GFN-Features (Fork)" + "</font>"
+            font.pointSize: 12
+
+            // Upscaling, sharpening and chroma reconstruction are implemented in the Direct3D 11 renderer
+            property bool postProcessingSupported: Qt.platform.os === "windows"
+
+            function setUpscalingMode(mode) {
+                for (var i = 0; i < upscalingListModel.count; i++) {
+                    if (upscalingListModel.get(i).val === mode) {
+                        upscalingComboBox.currentIndex = i
+                        break
+                    }
+                }
+                StreamingPreferences.upscalingMode = mode
+            }
+
+            // 0 = Competitive, 1 = Balanced, 2 = Quality
+            function applyPreset(preset) {
+                if (preset === 0) {
+                    // Lowest latency: no V-Sync, no pacing, no extra render passes, highest display refresh rate
+                    lowLatencyCheck.checked = true
+                    vsyncCheck.checked = false
+                    framePacingCheck.checked = false
+                    setUpscalingMode(StreamingPreferences.UM_OFF)
+                    sharpnessSlider.value = 0
+                    chromaReconCheck.checked = true
+
+                    var bestIndex = -1
+                    var bestFps = 0
+                    for (var i = 0; i < fpsComboBox.model.count; i++) {
+                        var entry = fpsComboBox.model.get(i)
+                        if (entry.is_custom) {
+                            continue
+                        }
+                        var entryFps = parseInt(entry.video_fps)
+                        if (entryFps > bestFps) {
+                            bestFps = entryFps
+                            bestIndex = i
+                        }
+                    }
+                    if (bestIndex >= 0) {
+                        fpsComboBox.currentIndex = bestIndex
+                        fpsComboBox.updateBitrateForSelection()
+                    }
+                }
+                else if (preset === 1) {
+                    // Good picture with low latency
+                    lowLatencyCheck.checked = false
+                    vsyncCheck.checked = true
+                    framePacingCheck.checked = false
+                    setUpscalingMode(StreamingPreferences.UM_FSR)
+                    sharpnessSlider.value = 25
+                    chromaReconCheck.checked = true
+                }
+                else {
+                    // Best picture, smoothest playback
+                    lowLatencyCheck.checked = false
+                    vsyncCheck.checked = true
+                    framePacingCheck.checked = true
+                    setUpscalingMode(StreamingPreferences.UM_AI)
+                    sharpnessSlider.value = 35
+                    chromaReconCheck.checked = true
+                }
+
+                presetAppliedLabel.text = qsTr("Profil angewendet: %1").arg(preset === 0 ? "Competitive" : (preset === 1 ? "Balanced" : "Qualität"))
+                presetAppliedLabel.visible = true
+            }
+
+            Column {
+                anchors.fill: parent
+                spacing: 5
+
+                Label {
+                    width: parent.width
+                    text: "Schnellprofile (wie bei GeForce NOW)"
+                    font.pointSize: 12
+                    wrapMode: Text.Wrap
+                }
+
+                Label {
+                    width: parent.width
+                    text: "Competitive = minimale Latenz und maximale FPS. Balanced = scharfes Bild bei niedriger Latenz. Qualität = bestes Bild mit KI-Upscaling und flüssiger Bildausgabe."
+                    font.pointSize: 9
+                    wrapMode: Text.Wrap
+                }
+
+                Row {
+                    spacing: 5
+                    width: parent.width
+
+                    Button {
+                        id: presetCompetitiveButton
+                        text: "Competitive"
+                        onClicked: gfnSettingsGroupBox.applyPreset(0)
+                    }
+
+                    Button {
+                        id: presetBalancedButton
+                        text: "Balanced"
+                        onClicked: gfnSettingsGroupBox.applyPreset(1)
+                    }
+
+                    Button {
+                        id: presetQualityButton
+                        text: "Qualität"
+                        onClicked: gfnSettingsGroupBox.applyPreset(2)
+                    }
+                }
+
+                Label {
+                    id: presetAppliedLabel
+                    width: parent.width
+                    visible: false
+                    font.pointSize: 9
+                    color: "skyblue"
+                    wrapMode: Text.Wrap
+                }
+
+                Label {
+                    width: parent.width
+                    text: "Upscaling"
+                    font.pointSize: 12
+                    wrapMode: Text.Wrap
+                    visible: gfnSettingsGroupBox.postProcessingSupported
+                }
+
+                Label {
+                    width: parent.width
+                    text: "Greift, wenn die Stream-Auflösung kleiner ist als dein Fenster/Bildschirm. Tipp: 1080p streamen und auf 1440p/4K hochrechnen lassen spart Bandbreite."
+                    font.pointSize: 9
+                    wrapMode: Text.Wrap
+                    visible: gfnSettingsGroupBox.postProcessingSupported
+                }
+
+                AutoResizingComboBox {
+                    id: upscalingComboBox
+                    visible: gfnSettingsGroupBox.postProcessingSupported
+                    textRole: "text"
+                    hoverEnabled: true
+                    model: ListModel {
+                        id: upscalingListModel
+                        ListElement {
+                            text: "KI-Upscaling (NVIDIA RTX / Intel, sonst FSR)"
+                            val: StreamingPreferences.UM_AI
+                        }
+                        ListElement {
+                            text: "AMD FSR 1 (alle Grafikkarten)"
+                            val: StreamingPreferences.UM_FSR
+                        }
+                        ListElement {
+                            text: "Aus (Moonlight-Standard)"
+                            val: StreamingPreferences.UM_OFF
+                        }
+                    }
+
+                    Component.onCompleted: {
+                        var saved = StreamingPreferences.upscalingMode
+                        currentIndex = 0
+                        for (var i = 0; i < upscalingListModel.count; i++) {
+                            if (upscalingListModel.get(i).val === saved) {
+                                currentIndex = i
+                                break
+                            }
+                        }
+                    }
+
+                    // ::onActivated must be used, as it only listens for when the index is changed by a human
+                    onActivated: {
+                        StreamingPreferences.upscalingMode = upscalingListModel.get(currentIndex).val
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 8000
+                    ToolTip.visible: hovered
+                    ToolTip.text: "KI-Upscaling nutzt RTX Video Super Resolution (NVIDIA RTX, im NVIDIA-Treiber unter 'RTX Video Enhancement' einschalten) oder Intel VSR. Auf AMD-Grafikkarten wird automatisch FSR verwendet."
+                }
+
+                Label {
+                    id: sharpnessTitle
+                    width: parent.width
+                    text: "Bildschärfe: " + Math.round(sharpnessSlider.value) + " %"
+                    font.pointSize: 12
+                    wrapMode: Text.Wrap
+                    visible: gfnSettingsGroupBox.postProcessingSupported
+                }
+
+                Slider {
+                    id: sharpnessSlider
+                    visible: gfnSettingsGroupBox.postProcessingSupported
+                    width: parent.width
+                    from: 0
+                    to: 100
+                    stepSize: 5
+                    snapMode: "SnapAlways"
+                    value: StreamingPreferences.sharpness
+
+                    onValueChanged: {
+                        StreamingPreferences.sharpness = Math.round(value)
+                    }
+                }
+
+                CheckBox {
+                    id: chromaReconCheck
+                    width: parent.width
+                    visible: gfnSettingsGroupBox.postProcessingSupported
+                    hoverEnabled: true
+                    text: "Künstliches 4:4:4 (schärfere Farbkanten)"
+                    font.pointSize: 12
+                    checked: StreamingPreferences.chromaReconstruction
+                    onCheckedChanged: {
+                        StreamingPreferences.chromaReconstruction = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 8000
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Rekonstruiert die halbierte Farbauflösung (4:2:0) anhand der Helligkeit. Text und farbige Kanten werden klarer. Echtes 4:4:4 (Erweiterte Einstellungen) ist besser, braucht aber einen Host-Encoder, der es unterstützt."
+                }
+
+                CheckBox {
+                    id: lowLatencyCheck
+                    width: parent.width
+                    hoverEnabled: true
+                    text: "Low-Latency-Modus"
+                    font.pointSize: 12
+                    checked: StreamingPreferences.lowLatencyMode
+                    onCheckedChanged: {
+                        StreamingPreferences.lowLatencyMode = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 8000
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Schaltet V-Sync und Frame-Pacing ab, zeigt immer nur das neueste Bild an (verspätete Bilder werden verworfen) und gibt Moonlight höhere CPU/GPU-Priorität. Spart einige Millisekunden, kann aber Tearing verursachen."
+                }
+
+                Label {
+                    width: parent.width
+                    text: "Hinweis: Frame Generation am besten auf dem Gaming-PC aktivieren (AMD Fluid Motion Frames / DLSS FG). Am Client würde sie Latenz hinzufügen."
+                    font.pointSize: 9
+                    wrapMode: Text.Wrap
+                }
+            }
+        }
+
         GroupBox {
 
             id: audioSettingsGroupBox

@@ -39,7 +39,9 @@ Pacer::Pacer(IFFmpegRenderer* renderer, PVIDEO_STATS videoStats) :
     m_VsyncRenderer(renderer),
     m_MaxVideoFps(0),
     m_DisplayFps(0),
-    m_VideoStats(videoStats)
+    m_VideoStats(videoStats),
+    m_RendererAttributes(0),
+    m_LowLatencyMode(false)
 {
 
 }
@@ -191,8 +193,23 @@ int Pacer::renderThread(void* context)
     return 0;
 }
 
+void Pacer::setLowLatencyMode(bool enabled)
+{
+    m_LowLatencyMode = enabled;
+}
+
 void Pacer::enqueueFrameForRenderingAndUnlock(AVFrame *frame)
 {
+    if (m_LowLatencyMode && m_VsyncSource == nullptr) {
+        // GFN fork: Low-latency mode. If the renderer hasn't picked up the
+        // previous frame(s) yet, drop them so we always display the newest one.
+        while (!m_RenderQueue.isEmpty()) {
+            AVFrame* staleFrame = m_RenderQueue.dequeue();
+            m_VideoStats->pacerDroppedFrames++;
+            av_frame_free(&staleFrame);
+        }
+    }
+
     dropFrameForEnqueue(m_RenderQueue);
     m_RenderQueue.enqueue(frame);
 

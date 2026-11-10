@@ -45,8 +45,60 @@ typedef struct _CSC_CONST_BUF
 
     // Max UV coordinates to avoid sampling alignment padding
     float chromaUVMax[2];
+
+    // GFN fork: plane sizes in texels for the chroma reconstruction shader
+    // (luma width, luma height, chroma width, chroma height)
+    float planeSizes[4];
+
+    // GFN fork: chroma reconstruction parameters (x = strength)
+    float cflParams[4];
 } CSC_CONST_BUF, *PCSC_CONST_BUF;
 static_assert(sizeof(CSC_CONST_BUF) % 16 == 0, "Constant buffer sizes must be a multiple of 16");
+
+// GFN fork: AMD FSR 1 EASU constants (see FsrEasuCon() in ffx_fsr1.h)
+typedef struct _EASU_CONST_BUF
+{
+    float con0[4];
+    float con1[4];
+    float con2[4];
+    float con3[4];
+} EASU_CONST_BUF;
+static_assert(sizeof(EASU_CONST_BUF) % 16 == 0, "Constant buffer sizes must be a multiple of 16");
+
+// GFN fork: AMD FSR 1 RCAS constants
+typedef struct _RCAS_CONST_BUF
+{
+    // x = sharpening amount (0..1)
+    float params[4];
+
+    // xy = top-left of the video rectangle in the render target, zw = input texture size
+    float rect[4];
+} RCAS_CONST_BUF;
+static_assert(sizeof(RCAS_CONST_BUF) % 16 == 0, "Constant buffer sizes must be a multiple of 16");
+
+// GFN fork: vendor extensions for driver-based video super resolution
+// NVIDIA RTX Video Super Resolution (stream extension)
+static const GUID k_NvidiaPPEInterfaceGUID =
+    { 0xd43ce1b3, 0x1f4b, 0x48ac, { 0xba, 0xee, 0xc3, 0xc2, 0x53, 0x75, 0xe6, 0xf7 } };
+
+// Intel Video Super Resolution (Intel VPE interface)
+static const GUID k_IntelVpeInterfaceGUID =
+    { 0xedd1d4b9, 0x8659, 0x4cbc, { 0xa4, 0xd6, 0x98, 0x97, 0xa9, 0x64, 0x91, 0x9a } };
+#define INTEL_VPE_FN_VERSION 0x01
+#define INTEL_VPE_FN_MODE 0x20
+#define INTEL_VPE_FN_SCALING 0x37
+#define INTEL_VPE_VERSION_3 0x0003
+#define INTEL_VPE_MODE_PREPROC 0x01
+#define INTEL_VPE_SCALING_SUPER_RESOLUTION 0x2
+
+typedef struct _INTEL_VPE_EXT
+{
+    UINT function;
+    void* param;
+} INTEL_VPE_EXT;
+
+#define PCI_VENDOR_NVIDIA 0x10DE
+#define PCI_VENDOR_INTEL 0x8086
 
 static const std::array<const char*, D3D11VARenderer::PixelShaders::_COUNT> k_VideoShaderNames =
 {
@@ -63,7 +115,17 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_SwapChainColorTrc(AVCOL_TRC_UNSPECIFIED),
       m_AllowTearing(false),
       m_OverlayLock(0),
-      m_HwDeviceContext(nullptr)
+      m_HwDeviceContext(nullptr),
+      m_PpMode(PostProcessMode::None),
+      m_PpDirty(true),
+      m_PpDisabled(false),
+      m_PpFrameWidth(0),
+      m_PpFrameHeight(0),
+      m_PpDstRect(),
+      m_VideoDstRect(),
+      m_VsrState(VsrState::Untested),
+      m_AdapterVendorId(0),
+      m_RaisedProcessPriority(false)
 {
     m_ContextLock = SDL_CreateMutex();
 
@@ -74,7 +136,21 @@ D3D11VARenderer::~D3D11VARenderer()
 {
     DwmEnableMMCSS(FALSE);
 
+    // GFN fork: restore the process priority if low-latency mode raised it
+    if (m_RaisedProcessPriority) {
+        SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
+    }
+
     SDL_DestroyMutex(m_ContextLock);
+
+    // GFN fork: release post-processing resources
+    releasePostProcessingTargets();
+    m_CflPixelShader.Reset();
+    m_EasuPixelShader.Reset();
+    m_RcasPixelShader.Reset();
+    m_CscConstantBuffer.Reset();
+    m_VideoContext.Reset();
+    m_VideoDevice.Reset();
 
     m_VideoVertexBuffer.Reset();
     for (auto& shader : m_VideoPixelShaders) {
@@ -451,6 +527,9 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
         m_DevicesWithCodecSupport++;
     }
 
+    // GFN fork: remember the GPU vendor for driver-based super resolution
+    m_AdapterVendorId = adapterDesc.VendorId;
+
     success = true;
 
 Exit:
@@ -698,6 +777,13 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
         return false;
     }
 
+    // GFN fork: optional post-processing shaders and low-latency tweaks.
+    // Failures here are not fatal, we just fall back to the original behavior.
+    if (!params->testOnly) {
+        setupPostProcessingShaders();
+        applyLowLatencyTweaks();
+    }
+
     return true;
 }
 
@@ -898,6 +984,9 @@ void D3D11VARenderer::bindVideoVertexBuffer(bool frameChanged, AVFrame* frame)
         dst.h = m_DisplayHeight;
         StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
 
+        // GFN fork: remember where the video is drawn for post-processing
+        m_VideoDstRect = dst;
+
         // Convert screen space to normalized device coordinates
         SDL_FRect renderRect;
         StreamUtils::screenSpaceToNormalizedDeviceCoords(&dst, &renderRect, m_DisplayWidth, m_DisplayHeight);
@@ -960,13 +1049,20 @@ void D3D11VARenderer::bindColorConversion(bool frameChanged, AVFrame* frame)
             SDL_assert(false);
         }
     }
+    else if (m_DecoderParams.chromaReconstruction && m_CflPixelShader) {
+        // GFN fork: 4:2:0 shader with luma-guided chroma reconstruction ("artificial 4:4:4")
+        m_RenderDeviceContext->PSSetShader(m_CflPixelShader.Get(), nullptr, 0);
+    }
     else {
         // We'll need to use the generic 4:2:0 shader for this colorspace and color range combo
         m_RenderDeviceContext->PSSetShader(m_VideoPixelShaders[PixelShaders::GENERIC_YUV_420].Get(), nullptr, 0);
     }
 
-    // If nothing has changed since last frame, we're done
-    if (!frameChanged) {
+    // If nothing has changed since last frame, we just (re)bind our existing constants.
+    // NB: Post-processing passes use a different constant buffer slot, but we rebind
+    // anyway to be robust against frames that skipped color conversion (VSR).
+    if (!frameChanged && m_CscConstantBuffer) {
+        m_RenderDeviceContext->PSSetConstantBuffers(0, 1, m_CscConstantBuffer.GetAddressOf());
         return;
     }
 
@@ -1003,13 +1099,22 @@ void D3D11VARenderer::bindColorConversion(bool frameChanged, AVFrame* frame)
     constBuf.chromaUVMax[1] = frame->height != (int)framesContext->height ?
                                   ((float)(frame->height - 1) / framesContext->height) : 1.0f;
 
+    // GFN fork: texel sizes of the luma and (4:2:0) chroma planes
+    constBuf.planeSizes[0] = (float)framesContext->width;
+    constBuf.planeSizes[1] = (float)framesContext->height;
+    constBuf.planeSizes[2] = (float)((framesContext->width + 1) / 2);
+    constBuf.planeSizes[3] = (float)((framesContext->height + 1) / 2);
+
+    // GFN fork: full-strength chroma reconstruction
+    constBuf.cflParams[0] = 1.0f;
+
     D3D11_SUBRESOURCE_DATA constData = {};
     constData.pSysMem = &constBuf;
 
-    ComPtr<ID3D11Buffer> constantBuffer;
-    HRESULT hr = m_RenderDevice->CreateBuffer(&constDesc, &constData, &constantBuffer);
+    m_CscConstantBuffer.Reset();
+    HRESULT hr = m_RenderDevice->CreateBuffer(&constDesc, &constData, &m_CscConstantBuffer);
     if (SUCCEEDED(hr)) {
-        m_RenderDeviceContext->PSSetConstantBuffers(0, 1, constantBuffer.GetAddressOf());
+        m_RenderDeviceContext->PSSetConstantBuffers(0, 1, m_CscConstantBuffer.GetAddressOf());
     }
     else {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -1033,48 +1138,76 @@ void D3D11VARenderer::renderVideo(AVFrame* frame)
         unlockContext(this);
     }
 
-    UINT srvIndex;
-    if (m_BindDecoderOutputTextures) {
-        // Our indexing logic depends on a direct mapping into m_VideoTextureResourceViews
-        // based on the texture index provided by FFmpeg.
-        srvIndex = (uintptr_t)frame->data[1];
-        SDL_assert(srvIndex < m_VideoTextureResourceViews.size());
-        if (srvIndex >= m_VideoTextureResourceViews.size()) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "Unexpected texture index: %u",
-                         srvIndex);
-            return;
+    bool frameChanged = hasFrameFormatChanged(frame);
+    if (frameChanged) {
+        // Force the CSC constants to be regenerated for the new format
+        m_CscConstantBuffer.Reset();
+    }
+
+    // Bind our vertex buffer (this also computes m_VideoDstRect)
+    bindVideoVertexBuffer(frameChanged, frame);
+
+    // GFN fork: decide how this frame will be post-processed (upscaling/sharpening)
+    PostProcessMode ppMode = preparePostProcessing(frame, frameChanged);
+
+    if (ppMode == PostProcessMode::Vsr) {
+        // The video processor reads directly from the decoder output texture array,
+        // so no copy or SRV binding is required here.
+        if (renderVideoProcessorFrame(frame)) {
+            renderRcasPass(m_PpUpscaledSrv.Get());
+        }
+        else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "GFN: Video processor super resolution failed. Falling back to FSR.");
+            m_VsrState = VsrState::Failed;
+            m_PpDirty = true;
         }
     }
     else {
-        // Copy this frame into our video texture
-        m_RenderDeviceContext->CopySubresourceRegion1(m_VideoTexture.Get(), 0, 0, 0, 0,
-                                                      m_RenderSharedTextureArray.Get(),
-                                                      (int)(intptr_t)frame->data[1],
-                                                      nullptr, D3D11_COPY_DISCARD);
+        UINT srvIndex;
+        if (m_BindDecoderOutputTextures) {
+            // Our indexing logic depends on a direct mapping into m_VideoTextureResourceViews
+            // based on the texture index provided by FFmpeg.
+            srvIndex = (uintptr_t)frame->data[1];
+            SDL_assert(srvIndex < m_VideoTextureResourceViews.size());
+            if (srvIndex >= m_VideoTextureResourceViews.size()) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "Unexpected texture index: %u",
+                             srvIndex);
+                return;
+            }
+        }
+        else {
+            // Copy this frame into our video texture
+            m_RenderDeviceContext->CopySubresourceRegion1(m_VideoTexture.Get(), 0, 0, 0, 0,
+                                                          m_RenderSharedTextureArray.Get(),
+                                                          (int)(intptr_t)frame->data[1],
+                                                          nullptr, D3D11_COPY_DISCARD);
 
-        // SRV 0 is always mapped to the video texture
-        srvIndex = 0;
+            // SRV 0 is always mapped to the video texture
+            srvIndex = 0;
+        }
+
+        if (ppMode == PostProcessMode::None) {
+            // Bind our CSC shader (and constant buffer, if required)
+            bindColorConversion(frameChanged, frame);
+
+            // Bind SRVs for this frame
+            ID3D11ShaderResourceView* frameSrvs[] = { m_VideoTextureResourceViews[srvIndex][0].Get(), m_VideoTextureResourceViews[srvIndex][1].Get() };
+            m_RenderDeviceContext->PSSetShaderResources(0, 2, frameSrvs);
+
+            // Draw the video
+            m_RenderDeviceContext->DrawIndexed(6, 0, 0);
+
+            // Unbind SRVs for this frame
+            ID3D11ShaderResourceView* nullSrvs[2] = {};
+            m_RenderDeviceContext->PSSetShaderResources(0, 2, nullSrvs);
+        }
+        else {
+            // GFN fork: multi-pass rendering (YUV->RGB, FSR upscaling, RCAS sharpening)
+            renderPostProcessedVideo(frame, srvIndex, frameChanged, ppMode);
+        }
     }
-
-    bool frameChanged = hasFrameFormatChanged(frame);
-
-    // Bind our vertex buffer
-    bindVideoVertexBuffer(frameChanged, frame);
-
-    // Bind our CSC shader (and constant buffer, if required)
-    bindColorConversion(frameChanged, frame);
-
-    // Bind SRVs for this frame
-    ID3D11ShaderResourceView* frameSrvs[] = { m_VideoTextureResourceViews[srvIndex][0].Get(), m_VideoTextureResourceViews[srvIndex][1].Get() };
-    m_RenderDeviceContext->PSSetShaderResources(0, 2, frameSrvs);
-
-    // Draw the video
-    m_RenderDeviceContext->DrawIndexed(6, 0, 0);
-
-    // Unbind SRVs for this frame
-    ID3D11ShaderResourceView* nullSrvs[2] = {};
-    m_RenderDeviceContext->PSSetShaderResources(0, 2, nullSrvs);
 
     // Insert a fence to force the decode context to wait for the render context to finish reading
     if (m_DecodeDevice != m_RenderDevice) {
@@ -1769,6 +1902,10 @@ bool D3D11VARenderer::setupFrameRenderingResources(AVHWFramesContext* framesCont
 {
     auto d3d11vaFramesContext = (AVD3D11VAFramesContext*)framesContext->hwctx;
 
+    // GFN fork: the decoder texture pool is changing, so post-processing
+    // resources (video processor input views, etc.) must be recreated.
+    m_PpDirty = true;
+
     // Open the decoder texture array on the renderer device if we're using separate devices
     if (m_DecodeDevice != m_RenderDevice) {
         ComPtr<IDXGIResource1> dxgiDecoderResource;
@@ -1937,4 +2074,706 @@ bool D3D11VARenderer::setupTexturePoolViews(AVHWFramesContext* framesContext)
     }
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// GFN fork: post-processing (upscaling, sharpening, chroma reconstruction)
+// ---------------------------------------------------------------------------
+
+void D3D11VARenderer::setupPostProcessingShaders()
+{
+    auto loadShader = [this](const char* name, ComPtr<ID3D11PixelShader>& shader) {
+        QByteArray bytecode = Path::readDataFile(name);
+        if (bytecode.isEmpty()) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "GFN: Shader %s is missing. The feature using it is disabled.",
+                        name);
+            return;
+        }
+
+        HRESULT hr = m_RenderDevice->CreatePixelShader(bytecode.constData(), bytecode.length(), nullptr, &shader);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "GFN: ID3D11Device::CreatePixelShader(%s) failed: %x",
+                         name,
+                         hr);
+            shader.Reset();
+        }
+    };
+
+    if (m_DecoderParams.chromaReconstruction) {
+        loadShader("d3d11_yuv420_cfl_pixel.fxc", m_CflPixelShader);
+    }
+
+    if (m_DecoderParams.upscalingMode != StreamingPreferences::UM_OFF || m_DecoderParams.sharpness > 0) {
+        loadShader("d3d11_fsr_rcas_pixel.fxc", m_RcasPixelShader);
+    }
+
+    if (m_DecoderParams.upscalingMode != StreamingPreferences::UM_OFF) {
+        loadShader("d3d11_fsr_easu_pixel.fxc", m_EasuPixelShader);
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "GFN: Upscaling mode: %d | Sharpness: %d%% | Chroma reconstruction: %s | Low-latency mode: %s",
+                (int)m_DecoderParams.upscalingMode,
+                m_DecoderParams.sharpness,
+                m_CflPixelShader ? "on" : "off",
+                m_DecoderParams.lowLatencyMode ? "on" : "off");
+}
+
+void D3D11VARenderer::applyLowLatencyTweaks()
+{
+    if (!m_DecoderParams.lowLatencyMode) {
+        return;
+    }
+
+    // Ask the GPU scheduler to prioritize our rendering work over other applications
+    ComPtr<IDXGIDevice> dxgiDevice;
+    if (SUCCEEDED(m_RenderDevice.As(&dxgiDevice))) {
+        HRESULT hr = dxgiDevice->SetGPUThreadPriority(7);
+        if (FAILED(hr)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "GFN: IDXGIDevice::SetGPUThreadPriority() failed: %x",
+                        hr);
+        }
+    }
+
+    // Raise our CPU scheduling priority a bit while streaming
+    if (GetPriorityClass(GetCurrentProcess()) == NORMAL_PRIORITY_CLASS) {
+        if (SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS)) {
+            m_RaisedProcessPriority = true;
+        }
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "GFN: Low-latency tweaks applied");
+}
+
+void D3D11VARenderer::setViewport(int x, int y, int width, int height)
+{
+    D3D11_VIEWPORT viewport;
+
+    viewport.TopLeftX = (FLOAT)x;
+    viewport.TopLeftY = (FLOAT)y;
+    viewport.Width = (FLOAT)width;
+    viewport.Height = (FLOAT)height;
+    viewport.MinDepth = 0;
+    viewport.MaxDepth = 1;
+
+    m_RenderDeviceContext->RSSetViewports(1, &viewport);
+}
+
+D3D11VARenderer::PostProcessMode D3D11VARenderer::choosePostProcessMode(AVFrame* frame)
+{
+    // The RCAS pass is the final pass of every post-processing mode
+    if (m_PpDisabled || !m_RcasPixelShader) {
+        return PostProcessMode::None;
+    }
+
+    int dstW = m_VideoDstRect.w;
+    int dstH = m_VideoDstRect.h;
+    if (dstW <= 0 || dstH <= 0 || frame->width <= 0 || frame->height <= 0) {
+        return PostProcessMode::None;
+    }
+
+    bool upscaling = dstW >= frame->width && dstH >= frame->height &&
+                     (dstW > frame->width || dstH > frame->height);
+    bool oneToOne = dstW == frame->width && dstH == frame->height;
+
+    if (upscaling && m_DecoderParams.upscalingMode != StreamingPreferences::UM_OFF) {
+        // Driver-based AI upscaling only works for SDR 8-bit 4:2:0 content
+        if (m_DecoderParams.upscalingMode == StreamingPreferences::UM_AI &&
+                m_VsrState != VsrState::Failed &&
+                !(m_DecoderParams.videoFormat & (VIDEO_FORMAT_MASK_10BIT | VIDEO_FORMAT_MASK_YUV444)) &&
+                (m_AdapterVendorId == PCI_VENDOR_NVIDIA || m_AdapterVendorId == PCI_VENDOR_INTEL)) {
+            return PostProcessMode::Vsr;
+        }
+
+        if (m_EasuPixelShader) {
+            return PostProcessMode::Fsr;
+        }
+    }
+
+    if (oneToOne && m_DecoderParams.sharpness > 0) {
+        return PostProcessMode::SharpenOnly;
+    }
+
+    return PostProcessMode::None;
+}
+
+D3D11VARenderer::PostProcessMode D3D11VARenderer::preparePostProcessing(AVFrame* frame, bool frameChanged)
+{
+    PostProcessMode mode = choosePostProcessMode(frame);
+
+    if (mode == PostProcessMode::None) {
+        if (m_PpMode != PostProcessMode::None) {
+            releasePostProcessingTargets();
+        }
+        return PostProcessMode::None;
+    }
+
+    bool needsSetup = m_PpDirty || frameChanged || mode != m_PpMode ||
+                      frame->width != m_PpFrameWidth || frame->height != m_PpFrameHeight ||
+                      m_VideoDstRect.x != m_PpDstRect.x || m_VideoDstRect.y != m_PpDstRect.y ||
+                      m_VideoDstRect.w != m_PpDstRect.w || m_VideoDstRect.h != m_PpDstRect.h;
+    if (!needsSetup) {
+        return mode;
+    }
+
+    if (setupPostProcessingTargets(frame, mode)) {
+        if (mode == PostProcessMode::Vsr && m_VsrState != VsrState::Active) {
+            m_VsrState = VsrState::Active;
+        }
+        return mode;
+    }
+
+    releasePostProcessingTargets();
+
+    if (mode == PostProcessMode::Vsr) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "GFN: Driver super resolution is unavailable on this GPU/driver. Using FSR instead.");
+        m_VsrState = VsrState::Failed;
+
+        mode = choosePostProcessMode(frame);
+        if (mode != PostProcessMode::None && setupPostProcessingTargets(frame, mode)) {
+            return mode;
+        }
+
+        releasePostProcessingTargets();
+    }
+
+    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                 "GFN: Post-processing setup failed. Using the standard renderer.");
+    m_PpDisabled = true;
+    return PostProcessMode::None;
+}
+
+void D3D11VARenderer::releasePostProcessingTargets()
+{
+    m_PassVertexBuffer.Reset();
+    m_EasuConstantBuffer.Reset();
+    m_RcasConstantBuffer.Reset();
+
+    m_PpSourceSrv.Reset();
+    m_PpSourceRtv.Reset();
+    m_PpSourceTexture.Reset();
+
+    m_PpUpscaledSrv.Reset();
+    m_PpUpscaledRtv.Reset();
+    m_PpUpscaledTexture.Reset();
+
+    m_VideoProcessorInputViews.clear();
+    m_VideoProcessorOutputView.Reset();
+    m_VideoProcessor.Reset();
+    m_VideoProcessorEnumerator.Reset();
+
+    m_PpMode = PostProcessMode::None;
+    m_PpFrameWidth = 0;
+    m_PpFrameHeight = 0;
+    m_PpDstRect = {};
+}
+
+bool D3D11VARenderer::createRenderTexture(int width, int height, DXGI_FORMAT format,
+                                          ComPtr<ID3D11Texture2D>& texture,
+                                          ComPtr<ID3D11RenderTargetView>& rtv,
+                                          ComPtr<ID3D11ShaderResourceView>& srv)
+{
+    HRESULT hr;
+
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
+    texDesc.Format = format;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.SampleDesc.Quality = 0;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    texDesc.CPUAccessFlags = 0;
+    texDesc.MiscFlags = 0;
+
+    hr = m_RenderDevice->CreateTexture2D(&texDesc, nullptr, &texture);
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "GFN: ID3D11Device::CreateTexture2D(%dx%d) failed: %x",
+                     width, height, hr);
+        return false;
+    }
+
+    hr = m_RenderDevice->CreateRenderTargetView(texture.Get(), nullptr, &rtv);
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "GFN: ID3D11Device::CreateRenderTargetView() failed: %x",
+                     hr);
+        return false;
+    }
+
+    hr = m_RenderDevice->CreateShaderResourceView(texture.Get(), nullptr, &srv);
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "GFN: ID3D11Device::CreateShaderResourceView() failed: %x",
+                     hr);
+        return false;
+    }
+
+    return true;
+}
+
+bool D3D11VARenderer::setupPostProcessingTargets(AVFrame* frame, PostProcessMode mode)
+{
+    HRESULT hr;
+
+    releasePostProcessingTargets();
+
+    if (mode == PostProcessMode::None) {
+        return true;
+    }
+
+    const int dstW = m_VideoDstRect.w;
+    const int dstH = m_VideoDstRect.h;
+
+    // Full-target quad for intermediate passes. The texture coordinates exclude
+    // the decoder's alignment padding, just like the regular video vertex buffer.
+    {
+        auto framesContext = (AVHWFramesContext*)frame->hw_frames_ctx->data;
+        float uMax = (float)frame->width / framesContext->width;
+        float vMax = (float)frame->height / framesContext->height;
+
+        VERTEX verts[] =
+        {
+            {-1.0f, -1.0f, 0, vMax},
+            {-1.0f, 1.0f, 0, 0},
+            {1.0f, -1.0f, uMax, vMax},
+            {1.0f, 1.0f, uMax, 0},
+        };
+
+        D3D11_BUFFER_DESC vbDesc = {};
+        vbDesc.ByteWidth = sizeof(verts);
+        vbDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        vbDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        vbDesc.StructureByteStride = sizeof(VERTEX);
+
+        D3D11_SUBRESOURCE_DATA vbData = {};
+        vbData.pSysMem = verts;
+
+        hr = m_RenderDevice->CreateBuffer(&vbDesc, &vbData, &m_PassVertexBuffer);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "GFN: ID3D11Device::CreateBuffer() failed: %x",
+                         hr);
+            return false;
+        }
+    }
+
+    // RGB image at stream resolution
+    if (mode == PostProcessMode::SharpenOnly || mode == PostProcessMode::Fsr) {
+        if (!createRenderTexture(frame->width, frame->height, DXGI_FORMAT_R10G10B10A2_UNORM,
+                                 m_PpSourceTexture, m_PpSourceRtv, m_PpSourceSrv)) {
+            return false;
+        }
+    }
+
+    // RGB image at output resolution
+    if (mode == PostProcessMode::Fsr || mode == PostProcessMode::Vsr) {
+        if (!createRenderTexture(dstW, dstH,
+                                 mode == PostProcessMode::Vsr ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R10G10B10A2_UNORM,
+                                 m_PpUpscaledTexture, m_PpUpscaledRtv, m_PpUpscaledSrv)) {
+            return false;
+        }
+    }
+
+    // FSR EASU constants (FsrEasuCon)
+    if (mode == PostProcessMode::Fsr) {
+        const float inViewW = (float)frame->width;
+        const float inViewH = (float)frame->height;
+        const float inSizeW = (float)frame->width;
+        const float inSizeH = (float)frame->height;
+        const float outW = (float)dstW;
+        const float outH = (float)dstH;
+
+        EASU_CONST_BUF easu = {};
+        easu.con0[0] = inViewW / outW;
+        easu.con0[1] = inViewH / outH;
+        easu.con0[2] = 0.5f * inViewW / outW - 0.5f;
+        easu.con0[3] = 0.5f * inViewH / outH - 0.5f;
+        easu.con1[0] = 1.0f / inSizeW;
+        easu.con1[1] = 1.0f / inSizeH;
+        easu.con1[2] = 1.0f / inSizeW;
+        easu.con1[3] = -1.0f / inSizeH;
+        easu.con2[0] = -1.0f / inSizeW;
+        easu.con2[1] = 2.0f / inSizeH;
+        easu.con2[2] = 1.0f / inSizeW;
+        easu.con2[3] = 2.0f / inSizeH;
+        easu.con3[0] = 0.0f;
+        easu.con3[1] = 4.0f / inSizeH;
+        easu.con3[2] = 0.0f;
+        easu.con3[3] = 0.0f;
+
+        D3D11_BUFFER_DESC cbDesc = {};
+        cbDesc.ByteWidth = sizeof(easu);
+        cbDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+        D3D11_SUBRESOURCE_DATA cbData = {};
+        cbData.pSysMem = &easu;
+
+        hr = m_RenderDevice->CreateBuffer(&cbDesc, &cbData, &m_EasuConstantBuffer);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "GFN: ID3D11Device::CreateBuffer() failed: %x",
+                         hr);
+            return false;
+        }
+    }
+
+    // RCAS constants (final pass into the back buffer)
+    {
+        int inW = (mode == PostProcessMode::SharpenOnly) ? frame->width : dstW;
+        int inH = (mode == PostProcessMode::SharpenOnly) ? frame->height : dstH;
+
+        // The driver upscalers already sharpen, so we apply our sharpening at half strength there
+        float amount = m_DecoderParams.sharpness / 100.0f;
+        if (mode == PostProcessMode::Vsr) {
+            amount *= 0.5f;
+        }
+
+        RCAS_CONST_BUF rcas = {};
+        rcas.params[0] = SDL_max(0.0f, SDL_min(amount, 1.0f));
+        rcas.rect[0] = (float)m_VideoDstRect.x;
+        // m_VideoDstRect uses a bottom-left origin, but SV_Position uses a top-left origin
+        rcas.rect[1] = (float)(m_DisplayHeight - (m_VideoDstRect.y + m_VideoDstRect.h));
+        rcas.rect[2] = (float)inW;
+        rcas.rect[3] = (float)inH;
+
+        D3D11_BUFFER_DESC cbDesc = {};
+        cbDesc.ByteWidth = sizeof(rcas);
+        cbDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+        D3D11_SUBRESOURCE_DATA cbData = {};
+        cbData.pSysMem = &rcas;
+
+        hr = m_RenderDevice->CreateBuffer(&cbDesc, &cbData, &m_RcasConstantBuffer);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "GFN: ID3D11Device::CreateBuffer() failed: %x",
+                         hr);
+            return false;
+        }
+    }
+
+    if (mode == PostProcessMode::Vsr && !setupVideoProcessor(frame)) {
+        return false;
+    }
+
+    m_PpMode = mode;
+    m_PpFrameWidth = frame->width;
+    m_PpFrameHeight = frame->height;
+    m_PpDstRect = m_VideoDstRect;
+    m_PpDirty = false;
+
+    const char* modeName =
+        mode == PostProcessMode::Vsr ? (m_AdapterVendorId == PCI_VENDOR_NVIDIA ? "NVIDIA RTX Video Super Resolution" : "Intel Video Super Resolution") :
+        mode == PostProcessMode::Fsr ? "AMD FSR 1 (EASU + RCAS)" :
+                                       "RCAS sharpening";
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "GFN: Post-processing active: %s (%dx%d -> %dx%d)",
+                modeName, frame->width, frame->height, dstW, dstH);
+
+    return true;
+}
+
+bool D3D11VARenderer::setupVideoProcessor(AVFrame* frame)
+{
+    HRESULT hr;
+    auto framesContext = (AVHWFramesContext*)frame->hw_frames_ctx->data;
+
+    if (m_AdapterVendorId != PCI_VENDOR_NVIDIA && m_AdapterVendorId != PCI_VENDOR_INTEL) {
+        return false;
+    }
+
+    if (!m_VideoDevice) {
+        hr = m_RenderDevice.As(&m_VideoDevice);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "GFN: ID3D11Device::QueryInterface(ID3D11VideoDevice) failed: %x",
+                         hr);
+            return false;
+        }
+    }
+
+    if (!m_VideoContext) {
+        hr = m_RenderDeviceContext.As(&m_VideoContext);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "GFN: ID3D11DeviceContext::QueryInterface(ID3D11VideoContext1) failed: %x",
+                         hr);
+            return false;
+        }
+    }
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC contentDesc = {};
+    contentDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    contentDesc.InputFrameRate.Numerator = m_DecoderParams.frameRate > 0 ? m_DecoderParams.frameRate : 60;
+    contentDesc.InputFrameRate.Denominator = 1;
+    contentDesc.InputWidth = framesContext->width;
+    contentDesc.InputHeight = framesContext->height;
+    contentDesc.OutputFrameRate = contentDesc.InputFrameRate;
+    contentDesc.OutputWidth = m_VideoDstRect.w;
+    contentDesc.OutputHeight = m_VideoDstRect.h;
+    contentDesc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+
+    hr = m_VideoDevice->CreateVideoProcessorEnumerator(&contentDesc, &m_VideoProcessorEnumerator);
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "GFN: ID3D11VideoDevice::CreateVideoProcessorEnumerator() failed: %x",
+                     hr);
+        return false;
+    }
+
+    UINT formatSupport = 0;
+    hr = m_VideoProcessorEnumerator->CheckVideoProcessorFormat(m_TextureFormat, &formatSupport);
+    if (FAILED(hr) || !(formatSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "GFN: Video processor doesn't support input format %d",
+                    (int)m_TextureFormat);
+        return false;
+    }
+
+    formatSupport = 0;
+    hr = m_VideoProcessorEnumerator->CheckVideoProcessorFormat(DXGI_FORMAT_R8G8B8A8_UNORM, &formatSupport);
+    if (FAILED(hr) || !(formatSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "GFN: Video processor doesn't support RGBA8 output");
+        return false;
+    }
+
+    hr = m_VideoDevice->CreateVideoProcessor(m_VideoProcessorEnumerator.Get(), 0, &m_VideoProcessor);
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "GFN: ID3D11VideoDevice::CreateVideoProcessor() failed: %x",
+                     hr);
+        return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputViewDesc = {};
+    outputViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    outputViewDesc.Texture2D.MipSlice = 0;
+    hr = m_VideoDevice->CreateVideoProcessorOutputView(m_PpUpscaledTexture.Get(),
+                                                       m_VideoProcessorEnumerator.Get(),
+                                                       &outputViewDesc,
+                                                       &m_VideoProcessorOutputView);
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "GFN: ID3D11VideoDevice::CreateVideoProcessorOutputView() failed: %x",
+                     hr);
+        return false;
+    }
+
+    // Input views are created lazily for each decoder surface we see
+    {
+        D3D11_TEXTURE2D_DESC arrayDesc;
+        m_RenderSharedTextureArray->GetDesc(&arrayDesc);
+        m_VideoProcessorInputViews.clear();
+        m_VideoProcessorInputViews.resize(arrayDesc.ArraySize);
+    }
+
+    ID3D11VideoProcessor* vp = m_VideoProcessor.Get();
+
+    RECT srcRect = { 0, 0, frame->width, frame->height };
+    RECT dstRect = { 0, 0, m_VideoDstRect.w, m_VideoDstRect.h };
+    m_VideoContext->VideoProcessorSetStreamFrameFormat(vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    m_VideoContext->VideoProcessorSetStreamOutputRate(vp, 0, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_NORMAL, FALSE, nullptr);
+    m_VideoContext->VideoProcessorSetStreamSourceRect(vp, 0, TRUE, &srcRect);
+    m_VideoContext->VideoProcessorSetStreamDestRect(vp, 0, TRUE, &dstRect);
+    m_VideoContext->VideoProcessorSetOutputTargetRect(vp, TRUE, &dstRect);
+    m_VideoContext->VideoProcessorSetStreamAutoProcessingMode(vp, 0, FALSE);
+
+    // Color spaces
+    {
+        bool fullRange = frame->color_range == AVCOL_RANGE_JPEG;
+        DXGI_COLOR_SPACE_TYPE inputColorSpace;
+
+        switch (frame->colorspace) {
+        case AVCOL_SPC_BT709:
+            inputColorSpace = fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
+            break;
+        case AVCOL_SPC_BT2020_NCL:
+        case AVCOL_SPC_BT2020_CL:
+            inputColorSpace = fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020;
+            break;
+        default:
+            inputColorSpace = fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601;
+            break;
+        }
+
+        m_VideoContext->VideoProcessorSetStreamColorSpace1(vp, 0, inputColorSpace);
+        m_VideoContext->VideoProcessorSetOutputColorSpace1(vp, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+    }
+
+    // Enable the vendor-specific super resolution scaler
+    if (m_AdapterVendorId == PCI_VENDOR_NVIDIA) {
+        struct {
+            UINT version;
+            UINT method;
+            UINT enable;
+        } nvidiaExtension = { 0x1, 0x2, 0x1 };
+
+        hr = m_VideoContext->VideoProcessorSetStreamExtension(vp, 0, &k_NvidiaPPEInterfaceGUID,
+                                                              sizeof(nvidiaExtension), &nvidiaExtension);
+        if (FAILED(hr)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "GFN: NVIDIA RTX Video Super Resolution is not available: %x",
+                        hr);
+            return false;
+        }
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "GFN: NVIDIA RTX Video Super Resolution requested. Make sure 'RTX Video Enhancement > Super resolution' "
+                    "is enabled in the NVIDIA App or NVIDIA Control Panel.");
+    }
+    else {
+        INTEL_VPE_EXT intelExtension = {};
+
+        UINT version = INTEL_VPE_VERSION_3;
+        intelExtension.function = INTEL_VPE_FN_VERSION;
+        intelExtension.param = &version;
+        hr = m_VideoContext->VideoProcessorSetOutputExtension(vp, &k_IntelVpeInterfaceGUID,
+                                                              sizeof(intelExtension), &intelExtension);
+        if (FAILED(hr)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "GFN: Intel VPE version negotiation failed: %x",
+                        hr);
+            return false;
+        }
+
+        UINT vpeMode = INTEL_VPE_MODE_PREPROC;
+        intelExtension.function = INTEL_VPE_FN_MODE;
+        intelExtension.param = &vpeMode;
+        hr = m_VideoContext->VideoProcessorSetOutputExtension(vp, &k_IntelVpeInterfaceGUID,
+                                                              sizeof(intelExtension), &intelExtension);
+        if (FAILED(hr)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "GFN: Intel VPE mode selection failed: %x",
+                        hr);
+            return false;
+        }
+
+        UINT scaling = INTEL_VPE_SCALING_SUPER_RESOLUTION;
+        intelExtension.function = INTEL_VPE_FN_SCALING;
+        intelExtension.param = &scaling;
+        hr = m_VideoContext->VideoProcessorSetStreamExtension(vp, 0, &k_IntelVpeInterfaceGUID,
+                                                              sizeof(intelExtension), &intelExtension);
+        if (FAILED(hr)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "GFN: Intel Video Super Resolution is not available: %x",
+                        hr);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool D3D11VARenderer::renderVideoProcessorFrame(AVFrame* frame)
+{
+    HRESULT hr;
+    UINT index = (UINT)(uintptr_t)frame->data[1];
+
+    if (!m_VideoProcessor || !m_VideoProcessorOutputView || index >= m_VideoProcessorInputViews.size()) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "GFN: Video processor not ready for texture index %u",
+                     index);
+        return false;
+    }
+
+    if (!m_VideoProcessorInputViews[index]) {
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputViewDesc = {};
+        inputViewDesc.FourCC = 0;
+        inputViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        inputViewDesc.Texture2D.MipSlice = 0;
+        inputViewDesc.Texture2D.ArraySlice = index;
+
+        hr = m_VideoDevice->CreateVideoProcessorInputView(m_RenderSharedTextureArray.Get(),
+                                                          m_VideoProcessorEnumerator.Get(),
+                                                          &inputViewDesc,
+                                                          &m_VideoProcessorInputViews[index]);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "GFN: ID3D11VideoDevice::CreateVideoProcessorInputView() failed: %x",
+                         hr);
+            return false;
+        }
+    }
+
+    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+    stream.Enable = TRUE;
+    stream.pInputSurface = m_VideoProcessorInputViews[index].Get();
+
+    hr = m_VideoContext->VideoProcessorBlt(m_VideoProcessor.Get(), m_VideoProcessorOutputView.Get(), 0, 1, &stream);
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "GFN: ID3D11VideoContext::VideoProcessorBlt() failed: %x",
+                     hr);
+        return false;
+    }
+
+    return true;
+}
+
+void D3D11VARenderer::renderPostProcessedVideo(AVFrame* frame, UINT srvIndex, bool frameChanged, PostProcessMode mode)
+{
+    UINT stride = sizeof(VERTEX);
+    UINT offset = 0;
+    ID3D11ShaderResourceView* nullSrvs[2] = {};
+
+    // Pass 1: YUV -> RGB at stream resolution
+    m_RenderDeviceContext->OMSetRenderTargets(1, m_PpSourceRtv.GetAddressOf(), nullptr);
+    setViewport(0, 0, frame->width, frame->height);
+    m_RenderDeviceContext->IASetVertexBuffers(0, 1, m_PassVertexBuffer.GetAddressOf(), &stride, &offset);
+
+    bindColorConversion(frameChanged, frame);
+
+    ID3D11ShaderResourceView* frameSrvs[] = { m_VideoTextureResourceViews[srvIndex][0].Get(), m_VideoTextureResourceViews[srvIndex][1].Get() };
+    m_RenderDeviceContext->PSSetShaderResources(0, 2, frameSrvs);
+    m_RenderDeviceContext->DrawIndexed(6, 0, 0);
+    m_RenderDeviceContext->PSSetShaderResources(0, 2, nullSrvs);
+
+    ID3D11ShaderResourceView* rcasInput = m_PpSourceSrv.Get();
+
+    if (mode == PostProcessMode::Fsr) {
+        // Pass 2: FSR EASU upscaling to the output resolution
+        m_RenderDeviceContext->OMSetRenderTargets(1, m_PpUpscaledRtv.GetAddressOf(), nullptr);
+        setViewport(0, 0, m_PpDstRect.w, m_PpDstRect.h);
+
+        m_RenderDeviceContext->PSSetShader(m_EasuPixelShader.Get(), nullptr, 0);
+        m_RenderDeviceContext->PSSetConstantBuffers(1, 1, m_EasuConstantBuffer.GetAddressOf());
+        m_RenderDeviceContext->PSSetShaderResources(0, 1, m_PpSourceSrv.GetAddressOf());
+        m_RenderDeviceContext->DrawIndexed(6, 0, 0);
+        m_RenderDeviceContext->PSSetShaderResources(0, 1, nullSrvs);
+
+        rcasInput = m_PpUpscaledSrv.Get();
+    }
+
+    // Pass 3: RCAS sharpening into the back buffer
+    renderRcasPass(rcasInput);
+}
+
+void D3D11VARenderer::renderRcasPass(ID3D11ShaderResourceView* inputSrv)
+{
+    UINT stride = sizeof(VERTEX);
+    UINT offset = 0;
+    ID3D11ShaderResourceView* nullSrvs[1] = {};
+
+    // Draw into the video rectangle of the back buffer
+    m_RenderDeviceContext->OMSetRenderTargets(1, m_RenderTargetView.GetAddressOf(), nullptr);
+    setViewport(0, 0, m_DisplayWidth, m_DisplayHeight);
+    m_RenderDeviceContext->IASetVertexBuffers(0, 1, m_VideoVertexBuffer.GetAddressOf(), &stride, &offset);
+
+    m_RenderDeviceContext->PSSetShader(m_RcasPixelShader.Get(), nullptr, 0);
+    m_RenderDeviceContext->PSSetConstantBuffers(1, 1, m_RcasConstantBuffer.GetAddressOf());
+    m_RenderDeviceContext->PSSetShaderResources(0, 1, &inputSrv);
+    m_RenderDeviceContext->DrawIndexed(6, 0, 0);
+    m_RenderDeviceContext->PSSetShaderResources(0, 1, nullSrvs);
 }

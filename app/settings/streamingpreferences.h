@@ -119,6 +119,15 @@ public:
     };
     Q_ENUM(CaptureSysKeysMode);
 
+    // GFN fork: client-side upscaling of the video stream
+    enum UpscalingMode
+    {
+        UM_OFF,     // Original Moonlight behavior (bilinear)
+        UM_FSR,     // AMD FidelityFX Super Resolution 1 (EASU) - works on all GPUs
+        UM_AI,      // NVIDIA RTX Video Super Resolution / Intel VSR, falls back to FSR
+    };
+    Q_ENUM(UpscalingMode);
+
     Q_PROPERTY(int width MEMBER width NOTIFY displayModeChanged)
     Q_PROPERTY(int height MEMBER height NOTIFY displayModeChanged)
     Q_PROPERTY(int fps MEMBER fps NOTIFY displayModeChanged)
@@ -157,6 +166,10 @@ public:
     Q_PROPERTY(bool keepAwake MEMBER keepAwake NOTIFY keepAwakeChanged)
     Q_PROPERTY(CaptureSysKeysMode captureSysKeysMode MEMBER captureSysKeysMode NOTIFY captureSysKeysModeChanged)
     Q_PROPERTY(Language language MEMBER language NOTIFY languageChanged);
+    Q_PROPERTY(UpscalingMode upscalingMode MEMBER upscalingMode NOTIFY upscalingModeChanged)
+    Q_PROPERTY(int sharpness MEMBER sharpness NOTIFY sharpnessChanged)
+    Q_PROPERTY(bool chromaReconstruction MEMBER chromaReconstruction NOTIFY chromaReconstructionChanged)
+    Q_PROPERTY(bool lowLatencyMode MEMBER lowLatencyMode NOTIFY lowLatencyModeChanged)
 
     Q_INVOKABLE bool retranslate();
 
@@ -201,6 +214,12 @@ public:
     CaptureSysKeysMode captureSysKeysMode;
     RendererSelection rendererSelection;
 
+    // GFN fork options
+    UpscalingMode upscalingMode;
+    int sharpness; // 0-100 (%)
+    bool chromaReconstruction;
+    bool lowLatencyMode;
+
 signals:
     void displayModeChanged();
     void bitrateChanged();
@@ -238,6 +257,10 @@ signals:
     void keepAwakeChanged();
     void languageChanged();
     void rendererSelectionChanged();
+    void upscalingModeChanged();
+    void sharpnessChanged();
+    void chromaReconstructionChanged();
+    void lowLatencyModeChanged();
 
 private:
     explicit StreamingPreferences(QQmlEngine *qmlEngine);

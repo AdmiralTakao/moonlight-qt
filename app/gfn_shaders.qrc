@@ -1,0 +1,10 @@
+<RCC>
+    <!-- GFN fork: Direct3D 11 post-processing shaders (Windows only).
+         The .fxc files are compiled from the .hlsl sources by
+         app/shaders/build_gfn_hlsl.ps1 (run automatically in CI). -->
+    <qresource prefix="/data">
+        <file alias="d3d11_yuv420_cfl_pixel.fxc">shaders/d3d11_yuv420_cfl_pixel.fxc</file>
+        <file alias="d3d11_fsr_easu_pixel.fxc">shaders/d3d11_fsr_easu_pixel.fxc</file>
+        <file alias="d3d11_fsr_rcas_pixel.fxc">shaders/d3d11_fsr_rcas_pixel.fxc</file>
+    </qresource>
+</RCC>

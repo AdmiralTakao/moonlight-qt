@@ -40,6 +40,11 @@ public:
 
     bool initialize(SDL_Window* window, int maxVideoFps, bool enablePacing);
 
+    // GFN fork: In low-latency mode, only the newest decoded frame is kept
+    // in the render queue when not pacing. Older frames are dropped instead
+    // of being rendered late.
+    void setLowLatencyMode(bool enabled);
+
     void signalVsync();
 
     void renderOnMainThread();
@@ -76,4 +81,5 @@ private:
     int m_DisplayFps;
     PVIDEO_STATS m_VideoStats;
     int m_RendererAttributes;
+    bool m_LowLatencyMode;
 };
