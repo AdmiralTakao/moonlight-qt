@@ -1105,8 +1105,10 @@ void D3D11VARenderer::bindColorConversion(bool frameChanged, AVFrame* frame)
     constBuf.planeSizes[2] = (float)((framesContext->width + 1) / 2);
     constBuf.planeSizes[3] = (float)((framesContext->height + 1) / 2);
 
-    // GFN fork: full-strength chroma reconstruction
+    // GFN fork: full-strength chroma reconstruction with a luma similarity
+    // sigma of 0.05 (normalized luma), i.e. 1/(2*sigma^2) = 200
     constBuf.cflParams[0] = 1.0f;
+    constBuf.cflParams[1] = 200.0f;
 
     D3D11_SUBRESOURCE_DATA constData = {};
     constData.pSysMem = &constBuf;

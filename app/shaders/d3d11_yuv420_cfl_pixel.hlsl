@@ -1,13 +1,15 @@
 // GFN fork: "Artificial 4:4:4"
 //
-// YUV 4:2:0 -> RGB conversion with luma-guided chroma reconstruction
-// (Chroma-from-Luma). Regular 4:2:0 rendering bilinearly upsamples the
-// half-resolution chroma planes, which makes colored edges and text look
-// blurry. Here we fit a local linear model chroma = a * luma + b on the
-// 2x2 chroma neighborhood and use the full-resolution luma to predict
-// sharper chroma. The prediction is only used where luma actually explains
-// the chroma (high correlation and a real luma edge), otherwise we fall
-// back to normal bilinear chroma.
+// YUV 4:2:0 -> RGB conversion with luma-guided chroma upsampling
+// (joint bilateral upsampling). Regular 4:2:0 rendering bilinearly upsamples
+// the half-resolution chroma planes, which makes colors bleed across edges
+// and text look blurry. Here every chroma sample of the bilinear 2x2
+// footprint is additionally weighted by how similar its luma is to the luma
+// of the output pixel, so colors stop at luma edges.
+//
+// The weights are continuous across chroma texel boundaries (samples leaving
+// the footprint always have a bilinear weight of 0), so this never produces
+// block or grid artifacts.
 
 Texture2D<float> luminancePlane : register(t0);
 Texture2D<float2> chrominancePlane : register(t1);
@@ -26,7 +28,7 @@ cbuffer CSC_CONST_BUF : register(b0)
     float2 chromaOffset;
     float2 chromaTexMax;
     float4 planeSizes; // xy = luma texture size, zw = chroma texture size (texels)
-    float4 cflParams;  // x = reconstruction strength (0..1)
+    float4 cflParams;  // x = strength (0..1), y = luma similarity factor 1/(2*sigma^2)
 };
 
 float4 main(ShaderInput input) : SV_TARGET
@@ -37,11 +39,12 @@ float4 main(ShaderInput input) : SV_TARGET
     float lumaVal = luminancePlane.Sample(theSampler, input.tex);
     float2 chromaBilinear = chrominancePlane.Sample(theSampler, chromaTex);
 
-    // Find the 2x2 chroma texel neighborhood that bilinear filtering uses
+    // Find the 2x2 chroma texel footprint that bilinear filtering uses
     float2 chromaSize = planeSizes.zw;
     float2 invChromaSize = 1.0 / chromaSize;
     float2 chromaPos = chromaTex * chromaSize - 0.5;
     float2 chromaBase = floor(chromaPos);
+    float2 f = chromaPos - chromaBase;
     float2 gatherUV = (chromaBase + 1.0) * invChromaSize;
 
     // Gather component order: x = (0,1), y = (1,1), z = (1,0), w = (0,0)
@@ -59,34 +62,24 @@ float4 main(ShaderInput input) : SV_TARGET
     y4.z = luminancePlane.SampleLevel(theSampler, site00 + dx, 0);
     y4.w = luminancePlane.SampleLevel(theSampler, site00, 0);
 
-    // Local linear regression of chroma against luma
-    const float4 quarter = float4(0.25, 0.25, 0.25, 0.25);
-    float yMean = dot(y4, quarter);
-    float2 cMean = float2(dot(u4, quarter), dot(v4, quarter));
-    float4 dY = y4 - yMean;
-    float4 dU = u4 - cMean.x;
-    float4 dV = v4 - cMean.y;
+    // Spatial (bilinear) weights in gather order
+    float4 wSpatial = float4((1.0 - f.x) * f.y,
+                             f.x * f.y,
+                             f.x * (1.0 - f.y),
+                             (1.0 - f.x) * (1.0 - f.y));
 
-    float varY = dot(dY, dY);
-    float2 cov = float2(dot(dY, dU), dot(dY, dV));
-    float2 varC = float2(dot(dU, dU), dot(dV, dV));
+    // Range weights: prefer chroma samples whose luma matches this pixel
+    float4 dY = y4 - lumaVal;
+    float4 wRange = exp(-(dY * dY) * cflParams.y);
 
-    float2 slope = cov / max(varY, 1e-6);
-    float2 chromaCfl = cMean + slope * (lumaVal - yMean);
+    float4 w = wSpatial * wRange;
+    const float4 ones = float4(1.0, 1.0, 1.0, 1.0);
+    float wSum = dot(w, ones);
+    float2 chromaJbu = float2(dot(w, u4), dot(w, v4)) / max(wSum, 1e-5);
 
-    // Never overshoot the local chroma range (avoids halos/ringing)
-    float2 cMin = float2(min(min(u4.x, u4.y), min(u4.z, u4.w)),
-                         min(min(v4.x, v4.y), min(v4.z, v4.w)));
-    float2 cMax = float2(max(max(u4.x, u4.y), max(u4.z, u4.w)),
-                         max(max(v4.x, v4.y), max(v4.z, v4.w)));
-    chromaCfl = clamp(chromaCfl, cMin, cMax);
-
-    // Confidence: r^2 of the fit times "is there a real luma edge here?"
-    float2 r2 = saturate((cov * cov) / max(varY * varC, 1e-10));
-    float edge = saturate(varY * 400.0);
-    float2 alpha = r2 * edge * cflParams.x;
-
-    float2 chroma = lerp(chromaBilinear, chromaCfl, alpha);
+    // If no sample in the footprint matches (thin features), keep bilinear chroma
+    float alpha = saturate(wSum * 20.0) * cflParams.x;
+    float2 chroma = lerp(chromaBilinear, chromaJbu, alpha);
 
     float3 yuv = float3(lumaVal, chroma);
 
