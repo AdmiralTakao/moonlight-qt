@@ -3,6 +3,8 @@
 
 #include <QAbstractListModel>
 
+class QNetworkAccessManager;
+
 class ComputerModel : public QAbstractListModel
 {
     Q_OBJECT
@@ -16,7 +18,8 @@ class ComputerModel : public QAbstractListModel
         WakeableRole,
         StatusUnknownRole,
         ServerSupportedRole,
-        DetailsRole
+        DetailsRole,
+        WakeUrlRole // GFN fork
     };
 
 public:
@@ -45,9 +48,25 @@ public:
 
     Q_INVOKABLE Session* createSessionForCurrentGame(int computerIndex);
 
+    // GFN fork: "Start mit einem Tipp". A wake address is an http(s) URL (optionally prefixed
+    // with "POST ") that powers on/wakes the PC, e.g. a smart plug, UpSnap or a Home Assistant
+    // webhook. It is stored per PC (by UUID) in the settings.
+    Q_INVOKABLE void setWakeUrl(int computerIndex, QString url);
+
+    Q_INVOKABLE bool isComputerOnline(int computerIndex);
+
+    Q_INVOKABLE bool isComputerPaired(int computerIndex);
+
+    Q_INVOKABLE bool isComputerServerSupported(int computerIndex);
+
+    // Calls the wake address (if any) and sends Wake-on-LAN (if the MAC address is known).
+    // The result of the wake address arrives through wakeUrlCalled().
+    Q_INVOKABLE void wakeAndConnect(int computerIndex);
+
 signals:
     void pairingCompleted(QVariant error);
     void connectionTestCompleted(int result, QString blockedPorts);
+    void wakeUrlCalled(int computerIndex, bool success, QString message);
 
 private slots:
     void handleComputerStateChanged(NvComputer* computer);
@@ -55,6 +74,9 @@ private slots:
     void handlePairingCompleted(NvComputer* computer, QString error);
 
 private:
+    static QString wakeUrlKey(const QString& uuid);
+
     QVector<NvComputer*> m_Computers;
     ComputerManager* m_ComputerManager;
+    QNetworkAccessManager* m_WakeNam = nullptr;
 };

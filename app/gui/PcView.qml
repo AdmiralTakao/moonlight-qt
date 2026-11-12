@@ -79,7 +79,42 @@ CenteredGridView {
         model.initialize(ComputerManager)
         model.pairingCompleted.connect(pairingComplete)
         model.connectionTestCompleted.connect(testConnectionDialog.connectionTestComplete)
+        model.wakeUrlCalled.connect(wakeAndConnectDialog.wakeUrlCalled)
         return model
+    }
+
+    // GFN fork: "Start mit einem Tipp" - opens the app list (or pairing) for an online PC
+    function openComputer(index, name, paired, serverSupported)
+    {
+        if (!serverSupported) {
+            errorDialog.text = qsTr("The version of GeForce Experience on %1 is not supported by this build of Moonlight. You must update Moonlight to stream from %1.").arg(name)
+            errorDialog.helpText = ""
+            errorDialog.open()
+        }
+        else if (paired) {
+            // go to game view
+            var component = Qt.createComponent("AppView.qml")
+            var appView = component.createObject(stackView, {"computerIndex": index, "objectName": name})
+            stackView.push(appView)
+        }
+        else {
+            var pin = computerModel.generatePinString()
+
+            // Kick off pairing in the background
+            computerModel.pairComputer(index, pin)
+
+            // Display the pairing dialog
+            pairDialog.pin = pin
+            pairDialog.open()
+        }
+    }
+
+    function startWakeAndConnect(index, name, wakeable)
+    {
+        wakeAndConnectDialog.pcIndex = index
+        wakeAndConnectDialog.pcName = name
+        wakeAndConnectDialog.wakeable = wakeable
+        wakeAndConnectDialog.open()
     }
 
     Row {
@@ -192,6 +227,20 @@ CenteredGridView {
                     visible: !model.online && model.wakeable
                 }
                 NavigableMenuItem {
+                    text: "Wecken und verbinden"
+                    onTriggered: pcGrid.startWakeAndConnect(index, model.name, model.wakeable)
+                    visible: !model.online && (model.wakeable || model.wakeUrl !== "")
+                }
+                NavigableMenuItem {
+                    text: "Weck-Adresse festlegen…"
+                    onTriggered: {
+                        wakeUrlDialog.pcIndex = index
+                        wakeUrlDialog.pcName = model.name
+                        wakeUrlDialog.currentUrl = model.wakeUrl
+                        wakeUrlDialog.open()
+                    }
+                }
+                NavigableMenuItem {
                     text: qsTr("Test Network")
                     onTriggered: {
                         computerModel.testConnectionForComputer(index)
@@ -227,27 +276,10 @@ CenteredGridView {
 
         onClicked: {
             if (model.online) {
-                if (!model.serverSupported) {
-                    errorDialog.text = qsTr("The version of GeForce Experience on %1 is not supported by this build of Moonlight. You must update Moonlight to stream from %1.").arg(model.name)
-                    errorDialog.helpText = ""
-                    errorDialog.open()
-                }
-                else if (model.paired) {
-                    // go to game view
-                    var component = Qt.createComponent("AppView.qml")
-                    var appView = component.createObject(stackView, {"computerIndex": index, "objectName": model.name})
-                    stackView.push(appView)
-                }
-                else {
-                    var pin = computerModel.generatePinString()
-
-                    // Kick off pairing in the background
-                    computerModel.pairComputer(index, pin)
-
-                    // Display the pairing dialog
-                    pairDialog.pin = pin
-                    pairDialog.open()
-                }
+                pcGrid.openComputer(index, model.name, model.paired, model.serverSupported)
+            } else if (!model.statusUnknown && model.wakeUrl !== "") {
+                // GFN fork: one tap wakes the PC through its wake address and connects
+                pcGrid.startWakeAndConnect(index, model.name, model.wakeable)
             } else if (!model.online) {
                 // Using open() here because it may be activated by keyboard
                 pcContextMenu.open()
@@ -393,6 +425,143 @@ CenteredGridView {
 
                 Keys.onEnterPressed: {
                     renamePcDialog.accept()
+                }
+            }
+        }
+    }
+
+    // GFN fork: wakes the PC (wake address + Wake-on-LAN), waits until it is online and opens it
+    NavigableMessageDialog {
+        id: wakeAndConnectDialog
+        closePolicy: Popup.CloseOnEscape
+        standardButtons: Dialog.Cancel
+
+        property int pcIndex : -1
+        property string pcName : ""
+        property bool wakeable : false
+        property int elapsedSeconds : 0
+        property string wakeMessage : ""
+        readonly property int timeoutSeconds : 180
+
+        function updateText() {
+            text = "%1 wird geweckt… (%2 s)".arg(pcName).arg(elapsedSeconds) +
+                   (wakeMessage !== "" ? "\n\n" + wakeMessage : "") +
+                   "\n\nSobald der PC online ist, geht es automatisch weiter."
+        }
+
+        function wakeUrlCalled(computerIndex, success, message) {
+            if (!visible || computerIndex !== pcIndex) {
+                return
+            }
+            wakeMessage = message
+            updateText()
+        }
+
+        onAboutToShow: {
+            elapsedSeconds = 0
+            wakeMessage = ""
+            showSpinner = true
+            standardButtons = Dialog.Cancel
+            updateText()
+            computerModel.wakeAndConnect(pcIndex)
+            wakePollTimer.start()
+        }
+
+        onClosed: {
+            wakePollTimer.stop()
+        }
+
+        Timer {
+            id: wakePollTimer
+            interval: 1000
+            repeat: true
+
+            onTriggered: {
+                var dialog = wakeAndConnectDialog
+
+                if (computerModel.isComputerOnline(dialog.pcIndex)) {
+                    stop()
+                    dialog.close()
+
+                    pcGrid.openComputer(dialog.pcIndex,
+                                        dialog.pcName,
+                                        computerModel.isComputerPaired(dialog.pcIndex),
+                                        computerModel.isComputerServerSupported(dialog.pcIndex))
+                    return
+                }
+
+                dialog.elapsedSeconds++
+
+                if (dialog.elapsedSeconds >= dialog.timeoutSeconds) {
+                    stop()
+                    dialog.showSpinner = false
+                    dialog.imageSrc = "qrc:/res/baseline-error_outline-24px.svg"
+                    dialog.text = "%1 ist nach %2 Sekunden nicht online gekommen.".arg(dialog.pcName).arg(dialog.timeoutSeconds) +
+                                  (dialog.wakeMessage !== "" ? "\n\n" + dialog.wakeMessage : "") +
+                                  "\n\nPrüfe die Weck-Adresse, Wake-on-LAN im BIOS und ob die VPN-Verbindung (z. B. Tailscale) steht."
+                    dialog.standardButtons = Dialog.Ok
+                    return
+                }
+
+                // Repeat Wake-on-LAN now and then; the wake address is only called once
+                if (dialog.wakeable && dialog.elapsedSeconds % 15 === 0) {
+                    computerModel.wakeComputer(dialog.pcIndex)
+                }
+
+                dialog.updateText()
+            }
+        }
+    }
+
+    // GFN fork: per-PC wake address for "Start mit einem Tipp"
+    NavigableDialog {
+        id: wakeUrlDialog
+        property int pcIndex : -1
+        property string pcName : ""
+        property string currentUrl : ""
+
+        standardButtons: Dialog.Save | Dialog.Cancel
+
+        onOpened: {
+            wakeUrlText.text = currentUrl
+            wakeUrlText.forceActiveFocus()
+        }
+
+        onAccepted: {
+            computerModel.setWakeUrl(pcIndex, wakeUrlText.text)
+        }
+
+        ColumnLayout {
+            Label {
+                text: "Weck-Adresse für %1".arg(wakeUrlDialog.pcName)
+                font.bold: true
+            }
+
+            Label {
+                text: "Wird beim Antippen des ausgeschalteten PCs aufgerufen, danach wartet Moonlight, bis er online ist. " +
+                      "Beispiele:\n" +
+                      "Shelly: http://192.168.178.50/relay/0?turn=on\n" +
+                      "Tasmota: http://192.168.178.51/cm?cmnd=Power%20On\n" +
+                      "UpSnap/Home Assistant: deren Weck-URL (für Webhooks „POST “ voranstellen)\n" +
+                      "Leer lassen zum Entfernen. Die Adresse muss von unterwegs erreichbar sein, z. B. über Tailscale."
+                wrapMode: Text.Wrap
+                font.pointSize: 9
+                Layout.maximumWidth: 450
+            }
+
+            TextField {
+                id: wakeUrlText
+                placeholderText: "http://…"
+                Layout.fillWidth: true
+                Layout.minimumWidth: 400
+                focus: true
+
+                Keys.onReturnPressed: {
+                    wakeUrlDialog.accept()
+                }
+
+                Keys.onEnterPressed: {
+                    wakeUrlDialog.accept()
                 }
             }
         }

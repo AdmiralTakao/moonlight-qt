@@ -1,6 +1,13 @@
 #include "computermodel.h"
 
 #include <QThreadPool>
+#include <QSettings>
+#include <QUrl>
+#include <QNetworkAccessManager>
+#include <QNetworkProxy>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QDebug>
 
 ComputerModel::ComputerModel(QObject* object)
     : QAbstractListModel(object) {}
@@ -42,6 +49,8 @@ QVariant ComputerModel::data(const QModelIndex& index, int role) const
         return computer->state == NvComputer::CS_UNKNOWN;
     case ServerSupportedRole:
         return computer->isSupportedServerVersion;
+    case WakeUrlRole:
+        return QSettings().value(wakeUrlKey(computer->uuid)).toString();
     case DetailsRole: {
         QString state, pairState;
 
@@ -110,6 +119,7 @@ QHash<int, QByteArray> ComputerModel::roleNames() const
     names[StatusUnknownRole] = "statusUnknown";
     names[ServerSupportedRole] = "serverSupported";
     names[DetailsRole] = "details";
+    names[WakeUrlRole] = "wakeUrl";
 
     return names;
 }
@@ -170,6 +180,144 @@ void ComputerModel::wakeComputer(int computerIndex)
 
     DeferredWakeHostTask* wakeTask = new DeferredWakeHostTask(m_Computers[computerIndex]);
     QThreadPool::globalInstance()->start(wakeTask);
+}
+
+QString ComputerModel::wakeUrlKey(const QString& uuid)
+{
+    return QStringLiteral("gfn_wakeurls/") + uuid;
+}
+
+void ComputerModel::setWakeUrl(int computerIndex, QString url)
+{
+    Q_ASSERT(computerIndex < m_Computers.count());
+
+    NvComputer* computer = m_Computers[computerIndex];
+    QString uuid;
+    {
+        QReadLocker lock(&computer->lock);
+        uuid = computer->uuid;
+    }
+
+    QSettings settings;
+    url = url.trimmed();
+    if (url.isEmpty()) {
+        settings.remove(wakeUrlKey(uuid));
+    }
+    else {
+        settings.setValue(wakeUrlKey(uuid), url);
+    }
+
+    emit dataChanged(createIndex(computerIndex, 0), createIndex(computerIndex, 0));
+}
+
+bool ComputerModel::isComputerOnline(int computerIndex)
+{
+    if (computerIndex < 0 || computerIndex >= m_Computers.count()) {
+        return false;
+    }
+
+    NvComputer* computer = m_Computers[computerIndex];
+    QReadLocker lock(&computer->lock);
+    return computer->state == NvComputer::CS_ONLINE;
+}
+
+bool ComputerModel::isComputerPaired(int computerIndex)
+{
+    if (computerIndex < 0 || computerIndex >= m_Computers.count()) {
+        return false;
+    }
+
+    NvComputer* computer = m_Computers[computerIndex];
+    QReadLocker lock(&computer->lock);
+    return computer->pairState == NvComputer::PS_PAIRED;
+}
+
+bool ComputerModel::isComputerServerSupported(int computerIndex)
+{
+    if (computerIndex < 0 || computerIndex >= m_Computers.count()) {
+        return false;
+    }
+
+    NvComputer* computer = m_Computers[computerIndex];
+    QReadLocker lock(&computer->lock);
+    return computer->isSupportedServerVersion;
+}
+
+void ComputerModel::wakeAndConnect(int computerIndex)
+{
+    Q_ASSERT(computerIndex < m_Computers.count());
+
+    NvComputer* computer = m_Computers[computerIndex];
+    bool hasMac;
+    QString uuid;
+    {
+        QReadLocker lock(&computer->lock);
+        hasMac = !computer->macAddress.isEmpty();
+        uuid = computer->uuid;
+    }
+
+    // Moonlight's own Wake-on-LAN: works in the LAN, or through a VPN route into it
+    if (hasMac) {
+        QThreadPool::globalInstance()->start(new DeferredWakeHostTask(computer));
+    }
+
+    QString url = QSettings().value(wakeUrlKey(uuid)).toString().trimmed();
+    if (url.isEmpty()) {
+        emit wakeUrlCalled(computerIndex, hasMac,
+                           hasMac ? tr("Wake-on-LAN gesendet.")
+                                  : tr("Für diesen PC ist weder eine Weck-Adresse noch eine MAC-Adresse bekannt."));
+        return;
+    }
+
+    bool post = false;
+    if (url.startsWith(QStringLiteral("POST "), Qt::CaseInsensitive)) {
+        post = true;
+        url = url.mid(5).trimmed();
+    }
+    else if (url.startsWith(QStringLiteral("GET "), Qt::CaseInsensitive)) {
+        url = url.mid(4).trimmed();
+    }
+
+    QUrl wakeUrl = QUrl::fromUserInput(url);
+    if (!wakeUrl.isValid() || (wakeUrl.scheme() != QStringLiteral("http") && wakeUrl.scheme() != QStringLiteral("https"))) {
+        emit wakeUrlCalled(computerIndex, false, tr("Ungültige Weck-Adresse: %1").arg(url));
+        return;
+    }
+
+    if (m_WakeNam == nullptr) {
+        m_WakeNam = new QNetworkAccessManager(this);
+
+        // Like NvHTTP: smart plugs and helpers live on the local network or the VPN
+        m_WakeNam->setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
+    }
+
+    QNetworkRequest request(wakeUrl);
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+    request.setTransferTimeout(10000);
+#endif
+
+    QNetworkReply* reply;
+    if (post) {
+        request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("text/plain"));
+        reply = m_WakeNam->post(request, QByteArray());
+    }
+    else {
+        reply = m_WakeNam->get(request);
+    }
+
+    // Never log or show the URL itself: it may contain credentials
+    connect(reply, &QNetworkReply::finished, this, [this, reply, computerIndex]() {
+        int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (reply->error() == QNetworkReply::NoError) {
+            qInfo() << "GFN: Wake address called, HTTP status" << status;
+            emit wakeUrlCalled(computerIndex, true, tr("Weck-Adresse aufgerufen (HTTP %1).").arg(status));
+        }
+        else {
+            qWarning() << "GFN: Wake address failed:" << reply->error();
+            emit wakeUrlCalled(computerIndex, false, tr("Weck-Adresse nicht erreichbar: %1").arg(reply->errorString()));
+        }
+        reply->deleteLater();
+    });
 }
 
 void ComputerModel::renameComputer(int computerIndex, QString name)
