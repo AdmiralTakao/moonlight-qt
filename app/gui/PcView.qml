@@ -450,7 +450,8 @@ CenteredGridView {
         }
 
         function wakeUrlCalled(computerIndex, success, message) {
-            if (!visible || computerIndex !== pcIndex) {
+            // NB: may arrive while the dialog is still opening (Wake-on-LAN only)
+            if (computerIndex !== pcIndex) {
                 return
             }
             wakeMessage = message
