@@ -393,6 +393,7 @@ win32 {
 
     # GFN fork: D3D11 post-processing shaders (compiled by shaders/build_gfn_hlsl.ps1)
     RESOURCES += gfn_shaders.qrc
+    HEADERS += streaming/video/ffmpeg-renderers/mwsr.h
 }
 win32:!winrt {
     message(DXVA2 and D3D11VA renderers selected)

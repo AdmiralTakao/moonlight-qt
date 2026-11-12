@@ -124,7 +124,8 @@ public:
     {
         UM_OFF,     // Original Moonlight behavior (bilinear)
         UM_FSR,     // AMD FidelityFX Super Resolution 1 (EASU) - works on all GPUs
-        UM_AI,      // NVIDIA RTX Video Super Resolution / Intel VSR, falls back to FSR
+        UM_AI,      // NVIDIA RTX Video Super Resolution / Intel VSR, falls back to MWSR (then FSR)
+        UM_MWSR,    // MoonlightWeb Super Resolution (linckosz, MIT) - one pass, also downscales
     };
     Q_ENUM(UpscalingMode);
 

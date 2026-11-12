@@ -3,6 +3,16 @@
 
 #include "d3d11va.h"
 #include "dxutil.h"
+
+// GFN fork: MWSR's CPU side (MIT). It uses std::min/std::max, which the
+// <windows.h> min/max macros would break, so hide them while it is parsed.
+#pragma push_macro("min")
+#pragma push_macro("max")
+#undef min
+#undef max
+#include "mwsr.h"
+#pragma pop_macro("max")
+#pragma pop_macro("min")
 #include "path.h"
 #include "utils.h"
 
@@ -116,9 +126,13 @@ D3D11VARenderer::D3D11VARenderer(int decoderSelectionPass)
       m_AllowTearing(false),
       m_OverlayLock(0),
       m_HwDeviceContext(nullptr),
+      m_MwsrTaps(0),
       m_PpMode(PostProcessMode::None),
       m_PpDirty(true),
       m_PpDisabled(false),
+      m_PpStatusLock(0),
+      m_PpStatus(),
+      m_PpStatusKey(~0ULL),
       m_PpFrameWidth(0),
       m_PpFrameHeight(0),
       m_PpDstRect(),
@@ -148,6 +162,10 @@ D3D11VARenderer::~D3D11VARenderer()
     m_CflPixelShader.Reset();
     m_EasuPixelShader.Reset();
     m_RcasPixelShader.Reset();
+    m_MwsrUpPixelShader.Reset();
+    m_MwsrDown4PixelShader.Reset();
+    m_MwsrDown9PixelShader.Reset();
+    m_MwsrDown16PixelShader.Reset();
     m_CscConstantBuffer.Reset();
     m_VideoContext.Reset();
     m_VideoDevice.Reset();
@@ -1151,6 +1169,7 @@ void D3D11VARenderer::renderVideo(AVFrame* frame)
 
     // GFN fork: decide how this frame will be post-processed (upscaling/sharpening)
     PostProcessMode ppMode = preparePostProcessing(frame, frameChanged);
+    updateImageEnhancementStatus(ppMode, frame);
 
     if (ppMode == PostProcessMode::Vsr) {
         // The video processor reads directly from the decoder output texture array,
@@ -2115,6 +2134,15 @@ void D3D11VARenderer::setupPostProcessingShaders()
         loadShader("d3d11_fsr_easu_pixel.fxc", m_EasuPixelShader);
     }
 
+    // MWSR serves the MWSR mode and is the fallback of AI mode when the GPU has no driver upscaler
+    if (m_DecoderParams.upscalingMode == StreamingPreferences::UM_MWSR ||
+            m_DecoderParams.upscalingMode == StreamingPreferences::UM_AI) {
+        loadShader("d3d11_mwsr_up_pixel.fxc", m_MwsrUpPixelShader);
+        loadShader("d3d11_mwsr_down4_pixel.fxc", m_MwsrDown4PixelShader);
+        loadShader("d3d11_mwsr_down9_pixel.fxc", m_MwsrDown9PixelShader);
+        loadShader("d3d11_mwsr_down16_pixel.fxc", m_MwsrDown16PixelShader);
+    }
+
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "GFN: Upscaling mode: %d | Sharpness: %d%% | Chroma reconstruction: %s | Low-latency mode: %s",
                 (int)m_DecoderParams.upscalingMode,
@@ -2165,9 +2193,42 @@ void D3D11VARenderer::setViewport(int x, int y, int width, int height)
     m_RenderDeviceContext->RSSetViewports(1, &viewport);
 }
 
+ID3D11PixelShader* D3D11VARenderer::getMwsrPixelShader(int frameWidth, int frameHeight, int* taps)
+{
+    // The source is read without sRGB views, so the reductions use the shader's own light (LINEAR_LIGHT 1)
+    const mwsr::Regime regime = mwsr::regime(frameWidth, frameHeight, m_VideoDstRect.w, m_VideoDstRect.h);
+
+    ID3D11PixelShader* shader = nullptr;
+    int regimeTaps = 0;
+    if (regime.mode == mwsr::Mode::Up) {
+        shader = m_MwsrUpPixelShader.Get();
+    }
+    else if (regime.mode == mwsr::Mode::Down) {
+        regimeTaps = regime.taps;
+        switch (regime.taps) {
+        case 4:
+            shader = m_MwsrDown4PixelShader.Get();
+            break;
+        case 9:
+            shader = m_MwsrDown9PixelShader.Get();
+            break;
+        case 16:
+            shader = m_MwsrDown16PixelShader.Get();
+            break;
+        default:
+            break;
+        }
+    }
+
+    if (taps != nullptr) {
+        *taps = regimeTaps;
+    }
+    return shader;
+}
+
 D3D11VARenderer::PostProcessMode D3D11VARenderer::choosePostProcessMode(AVFrame* frame)
 {
-    // The RCAS pass is the final pass of every post-processing mode
+    // The RCAS shader is loaded whenever post-processing is enabled at all (MWSR doesn't use it)
     if (m_PpDisabled || !m_RcasPixelShader) {
         return PostProcessMode::None;
     }
@@ -2182,6 +2243,11 @@ D3D11VARenderer::PostProcessMode D3D11VARenderer::choosePostProcessMode(AVFrame*
                      (dstW > frame->width || dstH > frame->height);
     bool oneToOne = dstW == frame->width && dstH == frame->height;
 
+    // MWSR is tuned for SDR (sRGB-encoded values in 0..1), so 10-bit/HDR streams use FSR
+    bool mwsrAllowed = (m_DecoderParams.upscalingMode == StreamingPreferences::UM_MWSR ||
+                        m_DecoderParams.upscalingMode == StreamingPreferences::UM_AI) &&
+                       !(m_DecoderParams.videoFormat & VIDEO_FORMAT_MASK_10BIT);
+
     if (upscaling && m_DecoderParams.upscalingMode != StreamingPreferences::UM_OFF) {
         // Driver-based AI upscaling only works for SDR 8-bit 4:2:0 content
         if (m_DecoderParams.upscalingMode == StreamingPreferences::UM_AI &&
@@ -2191,9 +2257,20 @@ D3D11VARenderer::PostProcessMode D3D11VARenderer::choosePostProcessMode(AVFrame*
             return PostProcessMode::Vsr;
         }
 
+        if (mwsrAllowed && m_MwsrUpPixelShader) {
+            return PostProcessMode::Mwsr;
+        }
+
         if (m_EasuPixelShader) {
             return PostProcessMode::Fsr;
         }
+    }
+
+    // The stream is larger than the window on at least one axis: MWSR's reduction
+    // keeps more detail than the bilinear filter of the standard renderer
+    if (!upscaling && !oneToOne && mwsrAllowed && m_MwsrDown4PixelShader &&
+            getMwsrPixelShader(frame->width, frame->height, nullptr) != nullptr) {
+        return PostProcessMode::Mwsr;
     }
 
     if (oneToOne && m_DecoderParams.sharpness > 0) {
@@ -2250,6 +2327,121 @@ D3D11VARenderer::PostProcessMode D3D11VARenderer::preparePostProcessing(AVFrame*
     return PostProcessMode::None;
 }
 
+void D3D11VARenderer::updateImageEnhancementStatus(PostProcessMode mode, AVFrame* frame)
+{
+    const int inW = frame->width;
+    const int inH = frame->height;
+    const int outW = m_VideoDstRect.w;
+    const int outH = m_VideoDstRect.h;
+
+    // Only format the text when something it depends on has changed
+    unsigned long long key = (unsigned long long)mode;
+    key = key * 31 + (unsigned long long)m_VsrState;
+    key = key * 31 + (m_PpDisabled ? 1 : 0);
+    key = key * 31 + (unsigned long long)m_MwsrTaps;
+    key = (key << 16) ^ (unsigned long long)(inW & 0xFFFF);
+    key = (key << 16) ^ (unsigned long long)(inH & 0xFFFF);
+    key = key * 1000003ULL + (unsigned long long)(outW & 0xFFFF);
+    key = key * 1000003ULL + (unsigned long long)(outH & 0xFFFF);
+    if (key == m_PpStatusKey) {
+        return;
+    }
+
+    char text[sizeof(m_PpStatus)];
+    const int sharpness = m_DecoderParams.sharpness;
+    const bool tenBit = (m_DecoderParams.videoFormat & VIDEO_FORMAT_MASK_10BIT) != 0;
+    const bool yuv444 = (m_DecoderParams.videoFormat & VIDEO_FORMAT_MASK_YUV444) != 0;
+    const bool aiMode = m_DecoderParams.upscalingMode == StreamingPreferences::UM_AI;
+    const bool vsrVendor = m_AdapterVendorId == PCI_VENDOR_NVIDIA || m_AdapterVendorId == PCI_VENDOR_INTEL;
+
+    // NB: the performance overlay font is ASCII-only, so no umlauts here
+    switch (mode) {
+    case PostProcessMode::Vsr:
+        snprintf(text, sizeof(text), "Bildverbesserung: %s %dx%d -> %dx%d, Schaerfe %d%%",
+                 m_AdapterVendorId == PCI_VENDOR_NVIDIA ? "NVIDIA RTX VSR" : "Intel VSR",
+                 inW, inH, outW, outH, sharpness);
+        break;
+
+    case PostProcessMode::Mwsr:
+        if (m_MwsrTaps == 0) {
+            snprintf(text, sizeof(text), "Bildverbesserung: MWSR %dx%d -> %dx%d%s",
+                     inW, inH, outW, outH,
+                     !aiMode ? "" :
+                     (!vsrVendor ? " (GPU ohne Treiber-Upscaler)" :
+                      (m_VsrState == VsrState::Failed ? " (Treiber-Upscaler nicht verfuegbar)" : "")));
+        }
+        else {
+            snprintf(text, sizeof(text), "Bildverbesserung: MWSR verkleinert %dx%d -> %dx%d (%d Samples)",
+                     inW, inH, outW, outH, m_MwsrTaps);
+        }
+        break;
+
+    case PostProcessMode::Fsr:
+        snprintf(text, sizeof(text), "Bildverbesserung: AMD FSR 1 %dx%d -> %dx%d, Schaerfe %d%%%s",
+                 inW, inH, outW, outH, sharpness,
+                 (m_DecoderParams.upscalingMode != StreamingPreferences::UM_FSR && tenBit) ? " (HDR/10-bit)" : "");
+        break;
+
+    case PostProcessMode::SharpenOnly:
+        snprintf(text, sizeof(text), "Bildverbesserung: nur Schaerfe %d%% (Stream %dx%d = Fenster)",
+                 sharpness, inW, inH);
+        break;
+
+    case PostProcessMode::None:
+    default:
+        if (m_PpDisabled) {
+            snprintf(text, sizeof(text), "Bildverbesserung: aus (Fehler beim Einrichten, siehe Log)");
+        }
+        else if (m_DecoderParams.upscalingMode == StreamingPreferences::UM_OFF && sharpness == 0) {
+            snprintf(text, sizeof(text), "Bildverbesserung: aus (in den Einstellungen abgeschaltet)");
+        }
+        else if (!m_RcasPixelShader) {
+            snprintf(text, sizeof(text), "Bildverbesserung: aus (Shader fehlen in diesem Build)");
+        }
+        else if (inW == outW && inH == outH) {
+            snprintf(text, sizeof(text), "Bildverbesserung: aus (Stream %dx%d = Fenster, Schaerfe 0%%)",
+                     inW, inH);
+        }
+        else if (outW >= inW && outH >= inH) {
+            snprintf(text, sizeof(text), "Bildverbesserung: aus (Upscaling abgeschaltet, %dx%d -> %dx%d)",
+                     inW, inH, outW, outH);
+        }
+        else {
+            snprintf(text, sizeof(text), "Bildverbesserung: aus (Stream %dx%d groesser als Fenster %dx%d)",
+                     inW, inH, outW, outH);
+        }
+        break;
+    }
+
+    // The luma-guided chroma reconstruction runs in the YUV->RGB step of every mode but VSR
+    if (m_CflPixelShader && !yuv444 && mode != PostProcessMode::Vsr) {
+        SDL_strlcat(text, "\nKuenstliches 4:4:4: an", sizeof(text));
+    }
+
+    SDL_AtomicLock(&m_PpStatusLock);
+    SDL_strlcpy(m_PpStatus, text, sizeof(m_PpStatus));
+    m_PpStatusKey = key;
+    SDL_AtomicUnlock(&m_PpStatusLock);
+}
+
+bool D3D11VARenderer::getImageEnhancementStatus(char* buffer, int length)
+{
+    if (length <= 0) {
+        return false;
+    }
+
+    SDL_AtomicLock(&m_PpStatusLock);
+    if (m_PpStatus[0] == 0) {
+        SDL_strlcpy(buffer, "Bildverbesserung: wird vorbereitet", length);
+    }
+    else {
+        SDL_strlcpy(buffer, m_PpStatus, length);
+    }
+    SDL_AtomicUnlock(&m_PpStatusLock);
+
+    return true;
+}
+
 void D3D11VARenderer::releasePostProcessingTargets()
 {
     m_PassVertexBuffer.Reset();
@@ -2268,6 +2460,11 @@ void D3D11VARenderer::releasePostProcessingTargets()
     m_VideoProcessorOutputView.Reset();
     m_VideoProcessor.Reset();
     m_VideoProcessorEnumerator.Reset();
+
+    m_MwsrActivePixelShader.Reset();
+    m_MwsrConstantBuffer.Reset();
+    m_MwsrVertexBuffer.Reset();
+    m_MwsrTaps = 0;
 
     m_PpMode = PostProcessMode::None;
     m_PpFrameWidth = 0;
@@ -2369,7 +2566,7 @@ bool D3D11VARenderer::setupPostProcessingTargets(AVFrame* frame, PostProcessMode
     }
 
     // RGB image at stream resolution
-    if (mode == PostProcessMode::SharpenOnly || mode == PostProcessMode::Fsr) {
+    if (mode == PostProcessMode::SharpenOnly || mode == PostProcessMode::Fsr || mode == PostProcessMode::Mwsr) {
         if (!createRenderTexture(frame->width, frame->height, DXGI_FORMAT_R10G10B10A2_UNORM,
                                  m_PpSourceTexture, m_PpSourceRtv, m_PpSourceSrv)) {
             return false;
@@ -2469,6 +2666,58 @@ bool D3D11VARenderer::setupPostProcessingTargets(AVFrame* frame, PostProcessMode
         return false;
     }
 
+    // MWSR: its shader for this scale, its constants and a quad with 0..1 texture
+    // coordinates (the RGB source texture has no alignment padding)
+    if (mode == PostProcessMode::Mwsr) {
+        m_MwsrActivePixelShader = getMwsrPixelShader(frame->width, frame->height, &m_MwsrTaps);
+        if (!m_MwsrActivePixelShader) {
+            return false;
+        }
+
+        const mwsr::Constants mwsrConstants = mwsr::constants(frame->width, frame->height, dstW, dstH);
+
+        D3D11_BUFFER_DESC cbDesc = {};
+        cbDesc.ByteWidth = sizeof(mwsrConstants);
+        cbDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+        D3D11_SUBRESOURCE_DATA cbData = {};
+        cbData.pSysMem = &mwsrConstants;
+
+        hr = m_RenderDevice->CreateBuffer(&cbDesc, &cbData, &m_MwsrConstantBuffer);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "GFN: ID3D11Device::CreateBuffer() failed: %x",
+                         hr);
+            return false;
+        }
+
+        VERTEX verts[] =
+        {
+            {-1.0f, -1.0f, 0, 1.0f},
+            {-1.0f, 1.0f, 0, 0},
+            {1.0f, -1.0f, 1.0f, 1.0f},
+            {1.0f, 1.0f, 1.0f, 0},
+        };
+
+        D3D11_BUFFER_DESC vbDesc = {};
+        vbDesc.ByteWidth = sizeof(verts);
+        vbDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        vbDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        vbDesc.StructureByteStride = sizeof(VERTEX);
+
+        D3D11_SUBRESOURCE_DATA vbData = {};
+        vbData.pSysMem = verts;
+
+        hr = m_RenderDevice->CreateBuffer(&vbDesc, &vbData, &m_MwsrVertexBuffer);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "GFN: ID3D11Device::CreateBuffer() failed: %x",
+                         hr);
+            return false;
+        }
+    }
+
     m_PpMode = mode;
     m_PpFrameWidth = frame->width;
     m_PpFrameHeight = frame->height;
@@ -2478,6 +2727,7 @@ bool D3D11VARenderer::setupPostProcessingTargets(AVFrame* frame, PostProcessMode
     const char* modeName =
         mode == PostProcessMode::Vsr ? (m_AdapterVendorId == PCI_VENDOR_NVIDIA ? "NVIDIA RTX Video Super Resolution" : "Intel Video Super Resolution") :
         mode == PostProcessMode::Fsr ? "AMD FSR 1 (EASU + RCAS)" :
+        mode == PostProcessMode::Mwsr ? (m_MwsrTaps == 0 ? "MWSR upscale" : "MWSR reduction") :
                                        "RCAS sharpening";
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "GFN: Post-processing active: %s (%dx%d -> %dx%d)",
@@ -2743,6 +2993,30 @@ void D3D11VARenderer::renderPostProcessedVideo(AVFrame* frame, UINT srvIndex, bo
     m_RenderDeviceContext->PSSetShaderResources(0, 2, nullSrvs);
 
     ID3D11ShaderResourceView* rcasInput = m_PpSourceSrv.Get();
+
+    if (mode == PostProcessMode::Mwsr) {
+        // Pass 2: MWSR scales the RGB image straight into the video rectangle of the back buffer.
+        // It sharpens on its own (tuned for video streams), so no RCAS pass follows.
+        m_RenderDeviceContext->OMSetRenderTargets(1, m_RenderTargetView.GetAddressOf(), nullptr);
+
+        // m_VideoDstRect uses a bottom-left origin, but viewports use a top-left origin
+        setViewport(m_VideoDstRect.x,
+                    m_DisplayHeight - (m_VideoDstRect.y + m_VideoDstRect.h),
+                    m_VideoDstRect.w,
+                    m_VideoDstRect.h);
+        m_RenderDeviceContext->IASetVertexBuffers(0, 1, m_MwsrVertexBuffer.GetAddressOf(), &stride, &offset);
+
+        m_RenderDeviceContext->PSSetShader(m_MwsrActivePixelShader.Get(), nullptr, 0);
+        m_RenderDeviceContext->PSSetConstantBuffers(1, 1, m_MwsrConstantBuffer.GetAddressOf());
+        m_RenderDeviceContext->PSSetShaderResources(0, 1, m_PpSourceSrv.GetAddressOf());
+        m_RenderDeviceContext->DrawIndexed(6, 0, 0);
+        m_RenderDeviceContext->PSSetShaderResources(0, 1, nullSrvs);
+
+        // Leave the same state behind as the RCAS pass for the overlays
+        setViewport(0, 0, m_DisplayWidth, m_DisplayHeight);
+        m_RenderDeviceContext->IASetVertexBuffers(0, 1, m_VideoVertexBuffer.GetAddressOf(), &stride, &offset);
+        return;
+    }
 
     if (mode == PostProcessMode::Fsr) {
         // Pass 2: FSR EASU upscaling to the output resolution

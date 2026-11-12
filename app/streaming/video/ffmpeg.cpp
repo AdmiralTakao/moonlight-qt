@@ -908,6 +908,24 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
             offset += ret;
         }
 
+        // GFN fork: show whether and how the picture is upscaled/sharpened on this client
+        if (m_FrontendRenderer != nullptr) {
+            char enhancement[256];
+            if (!m_FrontendRenderer->getImageEnhancementStatus(enhancement, sizeof(enhancement))) {
+                snprintf(enhancement, sizeof(enhancement),
+                         "Bildverbesserung: nicht verfuegbar (Renderer: %s)",
+                         m_FrontendRenderer->getRendererName());
+            }
+
+            ret = snprintf(&output[offset], length - offset, "%s\n", enhancement);
+            if (ret < 0 || ret >= length - offset) {
+                SDL_assert(false);
+                return;
+            }
+
+            offset += ret;
+        }
+
         ret = snprintf(&output[offset],
                        length - offset,
                        "Incoming frame rate from network: %.2f FPS\n"
@@ -975,7 +993,7 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
 {
     if (stats.renderedFps > 0 || stats.renderedFrames != 0) {
-        char videoStatsStr[512];
+        char videoStatsStr[1024];
         stringifyVideoStats(stats, videoStatsStr, sizeof(videoStatsStr));
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,

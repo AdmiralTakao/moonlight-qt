@@ -323,6 +323,14 @@ public:
         // preparations might include clearing the window.
     }
 
+    // GFN fork: short, ASCII-only description of the client-side image enhancement
+    // (upscaling/sharpening) for the performance overlay. Called from the stats
+    // thread, so implementations must synchronize internally. Returns false if the
+    // renderer has no image enhancement support.
+    virtual bool getImageEnhancementStatus(char* /*buffer*/, int /*length*/) {
+        return false;
+    }
+
     RendererType getRendererType() {
         return m_Type;
     }

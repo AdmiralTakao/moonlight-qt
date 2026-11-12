@@ -28,6 +28,7 @@ public:
     virtual int getRendererAttributes() override;
     virtual int getDecoderCapabilities() override;
     virtual InitFailureReason getInitFailureReason() override;
+    virtual bool getImageEnhancementStatus(char* buffer, int length) override;
 
     enum PixelShaders {
         GENERIC_YUV_420,
@@ -43,6 +44,7 @@ private:
         SharpenOnly, // YUV->RGB at stream resolution, then RCAS sharpening 1:1
         Fsr,         // YUV->RGB, FSR 1 EASU upscaling, then RCAS sharpening
         Vsr,         // D3D11 video processor with NVIDIA/Intel super resolution, then RCAS
+        Mwsr,        // YUV->RGB, then MWSR (one pass, up- or downscaling) into the back buffer
     };
 
     enum class VsrState {
@@ -155,6 +157,18 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_EasuConstantBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_RcasConstantBuffer;
 
+    // GFN fork: MWSR (MoonlightWeb Super Resolution) pixel shaders: upscale and the
+    // 2x2, 3x3 and 4x4 reduction grids, plus the state of the active regime
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_MwsrUpPixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_MwsrDown4PixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_MwsrDown9PixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_MwsrDown16PixelShader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_MwsrActivePixelShader;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_MwsrConstantBuffer;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_MwsrVertexBuffer;
+    int m_MwsrTaps; // 0 = upscale, otherwise the reduction grid's samples
+    ID3D11PixelShader* getMwsrPixelShader(int frameWidth, int frameHeight, int* taps);
+
     // RGB image at stream resolution (input of FSR/RCAS)
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_PpSourceTexture;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_PpSourceRtv;
@@ -168,6 +182,12 @@ private:
     PostProcessMode m_PpMode;
     bool m_PpDirty;
     bool m_PpDisabled;
+
+    // GFN fork: image enhancement status for the performance overlay
+    void updateImageEnhancementStatus(PostProcessMode mode, AVFrame* frame);
+    SDL_SpinLock m_PpStatusLock;
+    char m_PpStatus[192];
+    unsigned long long m_PpStatusKey;
     int m_PpFrameWidth;
     int m_PpFrameHeight;
     SDL_Rect m_PpDstRect;

@@ -6,5 +6,9 @@
         <file alias="d3d11_yuv420_cfl_pixel.fxc">shaders/d3d11_yuv420_cfl_pixel.fxc</file>
         <file alias="d3d11_fsr_easu_pixel.fxc">shaders/d3d11_fsr_easu_pixel.fxc</file>
         <file alias="d3d11_fsr_rcas_pixel.fxc">shaders/d3d11_fsr_rcas_pixel.fxc</file>
+        <file alias="d3d11_mwsr_up_pixel.fxc">shaders/d3d11_mwsr_up_pixel.fxc</file>
+        <file alias="d3d11_mwsr_down4_pixel.fxc">shaders/d3d11_mwsr_down4_pixel.fxc</file>
+        <file alias="d3d11_mwsr_down9_pixel.fxc">shaders/d3d11_mwsr_down9_pixel.fxc</file>
+        <file alias="d3d11_mwsr_down16_pixel.fxc">shaders/d3d11_mwsr_down16_pixel.fxc</file>
     </qresource>
 </RCC>

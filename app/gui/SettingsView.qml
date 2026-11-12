@@ -929,7 +929,7 @@ Flickable {
                     lowLatencyCheck.checked = false
                     vsyncCheck.checked = true
                     framePacingCheck.checked = false
-                    setUpscalingMode(StreamingPreferences.UM_FSR)
+                    setUpscalingMode(StreamingPreferences.UM_MWSR)
                     sharpnessSlider.value = 10
                     chromaReconCheck.checked = true
                 }
@@ -1007,7 +1007,7 @@ Flickable {
 
                 Label {
                     width: parent.width
-                    text: "Greift, wenn die Stream-Auflösung kleiner ist als dein Fenster/Bildschirm. Tipp: 1080p streamen und auf 1440p/4K hochrechnen lassen spart Bandbreite."
+                    text: "Greift, wenn die Stream-Auflösung kleiner ist als dein Fenster/Bildschirm (MWSR auch, wenn sie größer ist). Bei gleicher Auflösung wirkt nur die Bildschärfe. Tipp: 1080p streamen und auf 1440p/4K hochrechnen lassen spart Bandbreite. Gegen Blockartefakte hilft nur mehr Bitrate."
                     font.pointSize: 9
                     wrapMode: Text.Wrap
                     visible: gfnSettingsGroupBox.postProcessingSupported
@@ -1021,8 +1021,12 @@ Flickable {
                     model: ListModel {
                         id: upscalingListModel
                         ListElement {
-                            text: "KI-Upscaling (NVIDIA RTX / Intel, sonst FSR)"
+                            text: "KI-Upscaling (NVIDIA RTX / Intel, sonst MWSR)"
                             val: StreamingPreferences.UM_AI
+                        }
+                        ListElement {
+                            text: "MWSR (schnell, ideal für AMD und iGPUs)"
+                            val: StreamingPreferences.UM_MWSR
                         }
                         ListElement {
                             text: "AMD FSR 1 (alle Grafikkarten)"
@@ -1053,7 +1057,7 @@ Flickable {
                     ToolTip.delay: 1000
                     ToolTip.timeout: 8000
                     ToolTip.visible: hovered
-                    ToolTip.text: "KI-Upscaling nutzt RTX Video Super Resolution (NVIDIA RTX, im NVIDIA-Treiber unter 'RTX Video Enhancement' einschalten) oder Intel VSR. Auf AMD-Grafikkarten wird automatisch FSR verwendet."
+                    ToolTip.text: "KI-Upscaling nutzt RTX Video Super Resolution (NVIDIA RTX, im NVIDIA-Treiber unter 'RTX Video Enhancement' einschalten) oder Intel VSR. Auf AMD-Grafikkarten wird automatisch MWSR verwendet. MWSR (von linckosz/MoonlightWeb) braucht nur einen Durchgang, ist auf integrierten Grafikchips mehrfach schneller als FSR und verkleinert auch sauber, wenn der Stream größer ist als das Fenster. Ob und wie gerade hochgerechnet wird, steht im Statistik-Overlay (Strg+Alt+Umschalt+S)."
                 }
 
                 Label {
@@ -1061,6 +1065,14 @@ Flickable {
                     width: parent.width
                     text: "Bildschärfe: " + Math.round(sharpnessSlider.value) + " %"
                     font.pointSize: 12
+                    wrapMode: Text.Wrap
+                    visible: gfnSettingsGroupBox.postProcessingSupported
+                }
+
+                Label {
+                    width: parent.width
+                    text: "Gilt für FSR, die Treiber-Upscaler und gleiche Auflösung. MWSR schärft selbst passend zur Skalierung. Bei niedriger Bitrate macht starkes Nachschärfen Blockartefakte sichtbarer."
+                    font.pointSize: 9
                     wrapMode: Text.Wrap
                     visible: gfnSettingsGroupBox.postProcessingSupported
                 }
